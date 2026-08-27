@@ -1,0 +1,9 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+sqlalchemy[asyncio]>=2.0
+asyncpg>=0.29
+pydantic>=2.6
+pydantic-settings>=2.2
+httpx>=0.27          # 调飞书webhook用
+apscheduler>=3.10    # 定时扫盘/定时发通知
+python-multipart
