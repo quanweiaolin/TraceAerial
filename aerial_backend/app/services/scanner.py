@@ -12,6 +12,7 @@
 
 可以由 APScheduler 定时调用，也可以挂在 FastAPI 的 POST /scan/trigger 接口里异步跑。
 """
+from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy import select
@@ -19,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Notification, ScanDiscovery, ScanJob, Video
 from app.services.hashing import compute_sha256
+from app.services.video_metadata import extract_new_video_fields
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
 
@@ -73,11 +75,16 @@ async def run_scan(session: AsyncSession, root_path: str, videos_only: bool = Fa
         if existing is None:
             # 真新增：insert videos 会触发DB里 trg_init_pipeline_status(若已建)，
             # 自动为它生成8个阶段的pending状态行；触发器还没建时这一步只是单纯insert
+
+            # 技术元数据(时长/分辨率/帧率/编码/collected_at)+GPS：ffprobe只读文件头，
+            # 不会像sha256那样耗时；device_id/collected_by保持不变，本次不处理
+            new_fields = extract_new_video_fields(path)
             video = Video(
                 sha256=digest,
                 original_name=path.name,
                 storage_path=str(path),
                 file_size_bytes=path.stat().st_size,
+                **new_fields,
             )
             session.add(video)
             files_new += 1
@@ -104,7 +111,6 @@ async def run_scan(session: AsyncSession, root_path: str, videos_only: bool = Fa
     job.files_new = files_new
     job.files_duplicate = files_duplicate
     job.status = "completed"
-    from datetime import datetime, timezone
     job.finished_at = datetime.now(timezone.utc)
 
     await session.commit()

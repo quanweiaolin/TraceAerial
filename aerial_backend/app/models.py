@@ -64,6 +64,8 @@ class Video(Base):
     device_id: Mapped[int | None] = mapped_column(ForeignKey("devices.device_id"))
     collected_at: Mapped[datetime | None]
     collected_by: Mapped[int | None] = mapped_column(ForeignKey("operators.id"))
+    collect_lon: Mapped[float | None]
+    collect_lat: Mapped[float | None]
     remark: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
