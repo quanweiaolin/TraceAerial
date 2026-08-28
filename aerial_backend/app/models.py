@@ -11,7 +11,7 @@ import enum
 from datetime import datetime
 
 from sqlalchemy import (
-    BigInteger, ForeignKey, LargeBinary, SmallInteger, String, Text,
+    BigInteger, DateTime, ForeignKey, LargeBinary, SmallInteger, String, Text,
     UniqueConstraint, func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -46,7 +46,7 @@ class Device(Base):
     model: Mapped[str | None] = mapped_column(String(64))
     sensor_config: Mapped[dict] = mapped_column(JSONB, default=dict)
     owner_unit: Mapped[str | None] = mapped_column(String(128))
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 class Video(Base):
     __tablename__ = "videos"
@@ -62,14 +62,16 @@ class Video(Base):
     fps: Mapped[float | None]
     codec: Mapped[str | None] = mapped_column(String(32))
     device_id: Mapped[int | None] = mapped_column(ForeignKey("devices.device_id"))
-    collected_at: Mapped[datetime | None]
+    # DB里是TIMESTAMPTZ，这里显式声明timezone=True，否则asyncpg绑定带时区的
+    # datetime(比如extract_new_video_fields返回的collected_at)时会报类型不匹配
+    collected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     collected_by: Mapped[int | None] = mapped_column(ForeignKey("operators.id"))
     collect_lon: Mapped[float | None]
     collect_lat: Mapped[float | None]
     remark: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
-    deleted_at: Mapped[datetime | None]
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     pipeline_status: Mapped[list["VideoPipelineStatus"]] = relationship(
         back_populates="video"
@@ -98,13 +100,13 @@ class VideoPipelineStatus(Base):
     status: Mapped[StageStatus] = mapped_column(default=StageStatus.pending)
     progress_percent: Mapped[int] = mapped_column(SmallInteger, default=0)
     operator_id: Mapped[int | None] = mapped_column(ForeignKey("operators.id"))
-    started_at: Mapped[datetime | None]
-    finished_at: Mapped[datetime | None]
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_message: Mapped[str | None] = mapped_column(Text)
     ref_table: Mapped[str | None] = mapped_column(String(64))
     ref_id: Mapped[int | None] = mapped_column(BigInteger)
     metadata_: Mapped[dict] = mapped_column("metadata", JSONB, default=dict)
-    updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     video: Mapped["Video"] = relationship(back_populates="pipeline_status")
     stage: Mapped["PipelineStage"] = relationship()
@@ -114,8 +116,8 @@ class ScanJob(Base):
     __tablename__ = "scan_jobs"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     root_path: Mapped[str] = mapped_column(Text)
-    started_at: Mapped[datetime] = mapped_column(server_default=func.now())
-    finished_at: Mapped[datetime | None]
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     files_found: Mapped[int] = mapped_column(default=0)
     files_new: Mapped[int] = mapped_column(default=0)
     files_duplicate: Mapped[int] = mapped_column(default=0)
@@ -138,7 +140,7 @@ class ScanDiscovery(Base):
     )
     is_new_task: Mapped[bool | None]
     error_message: Mapped[str | None] = mapped_column(Text)
-    discovered_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class Notification(Base):
@@ -154,8 +156,8 @@ class Notification(Base):
     payload: Mapped[dict] = mapped_column(JSONB, default=dict)
     status: Mapped[str] = mapped_column(String(16), default="pending")
     retry_count: Mapped[int] = mapped_column(default=0)
-    sent_at: Mapped[datetime | None]
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class DataSubmission(Base):
@@ -167,4 +169,4 @@ class DataSubmission(Base):
     payload: Mapped[dict | None] = mapped_column(JSONB)
     validation_status: Mapped[str] = mapped_column(String(16))
     validation_errors: Mapped[dict | None] = mapped_column(JSONB)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
