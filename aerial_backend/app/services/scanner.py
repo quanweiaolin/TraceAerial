@@ -47,7 +47,7 @@ async def run_scan(session: AsyncSession, root_path: str, videos_only: bool = Fa
         if not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS:
             continue
         files_found += 1
-
+        print(f"scanning: {path}") 
         discovery = None
         if not videos_only:
             discovery = ScanDiscovery(
