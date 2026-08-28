@@ -15,6 +15,7 @@ engine = create_async_engine(
     max_overflow=settings.db_max_overflow,
     pool_pre_ping=True,   # 连接失活自动重连，长时间跑的扫盘/后台任务尤其需要
     echo=False,
+    connect_args={"server_settings": {"search_path": "aerial,public"}},
 )
 
 AsyncSessionLocal = async_sessionmaker(

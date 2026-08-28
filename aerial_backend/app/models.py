@@ -38,7 +38,15 @@ class Operator(Base):
     display_name: Mapped[str | None] = mapped_column(String(64))
     role: Mapped[str | None] = mapped_column(String(32))
     dept: Mapped[str | None] = mapped_column(String(64))
-
+    
+class Device(Base):
+    __tablename__ = "devices"
+    device_id: Mapped[int] = mapped_column(primary_key=True)
+    device_code: Mapped[str] = mapped_column(String(64), unique=True)
+    model: Mapped[str | None] = mapped_column(String(64))
+    sensor_config: Mapped[dict] = mapped_column(JSONB, default=dict)
+    owner_unit: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 class Video(Base):
     __tablename__ = "videos"
