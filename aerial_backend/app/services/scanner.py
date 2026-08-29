@@ -23,6 +23,7 @@ from app.services.hashing import compute_sha256
 from app.services.video_metadata import extract_new_video_fields
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
+COMMIT_BATCH_SIZE = 100  # 每处理这么多个文件落库一次，避免大目录跑到一半被杀/OOM全部白扫
 
 
 async def run_scan(session: AsyncSession, root_path: str, videos_only: bool = False) -> ScanJob:
@@ -106,6 +107,17 @@ async def run_scan(session: AsyncSession, root_path: str, videos_only: bool = Fa
 
         if discovery is not None:
             discovery.resolved_video_sha256 = digest
+
+        # 每处理满COMMIT_BATCH_SIZE个文件落库一次，而不是等全部扫完才提交：
+        # 1) 大目录跑到一半被杀(OOM/tmux没了)，已经处理过的视频不会白扫
+        # 2) 已提交对象会被session释放，内存不会随扫描进度一直往上涨
+        # job的计数在videos_only模式下不会真的落库(job没add过)，这里赋值无副作用
+        job.files_found = files_found
+        job.files_new = files_new
+        job.files_duplicate = files_duplicate
+        if files_found % COMMIT_BATCH_SIZE == 0:
+            await session.commit()
+            print(f"[scan] committed at files_found={files_found}", flush=True)
 
     job.files_found = files_found
     job.files_new = files_new
