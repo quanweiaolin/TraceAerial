@@ -48,29 +48,51 @@ async def run_scan(session: AsyncSession, root_path: str, videos_only: bool = Fa
         if not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS:
             continue
         files_found += 1
-        print(f"scanning: {path}") 
+        print(f"scanning: {path}")
+        file_size = path.stat().st_size
+
+        # 缓存命中：之前扫过同路径+同大小的文件、且hash算完了，直接复用sha256，
+        # 不重新读整个文件。判断依据只用路径+大小，不含mtime——够用且没有额外
+        # 表结构成本，适合"归档只增不改"的场景；如果文件曾被原地替换成同样大小
+        # 的不同内容，这里会误判成"没变"，目前认为概率低到可以接受。
+        cached_sha256 = None
+        if not videos_only:
+            cache_result = await session.execute(
+                select(ScanDiscovery.sha256)
+                .where(ScanDiscovery.file_path == str(path))
+                .where(ScanDiscovery.file_size_bytes == file_size)
+                .where(ScanDiscovery.hash_status == "done")
+                .order_by(ScanDiscovery.discovered_at.desc())
+                .limit(1)
+            )
+            cached_sha256 = cache_result.scalar_one_or_none()
+
         discovery = None
         if not videos_only:
             discovery = ScanDiscovery(
                 scan_job_id=job.id,
                 file_path=str(path),
-                file_size_bytes=path.stat().st_size,
-                hash_status="hashing",
+                file_size_bytes=file_size,
+                hash_status="done" if cached_sha256 is not None else "hashing",
+                sha256=cached_sha256,
             )
             session.add(discovery)
             await session.flush()
 
-        try:
-            digest = compute_sha256(path)
-        except OSError as e:
-            if discovery is not None:
-                discovery.hash_status = "error"
-                discovery.error_message = str(e)
-            continue
+        if cached_sha256 is not None:
+            digest = cached_sha256
+        else:
+            try:
+                digest = compute_sha256(path)
+            except OSError as e:
+                if discovery is not None:
+                    discovery.hash_status = "error"
+                    discovery.error_message = str(e)
+                continue
 
-        if discovery is not None:
-            discovery.sha256 = digest
-            discovery.hash_status = "done"
+            if discovery is not None:
+                discovery.sha256 = digest
+                discovery.hash_status = "done"
 
         existing = await session.get(Video, digest)
         if existing is None:
@@ -84,7 +106,7 @@ async def run_scan(session: AsyncSession, root_path: str, videos_only: bool = Fa
                 sha256=digest,
                 original_name=path.name,
                 storage_path=str(path),
-                file_size_bytes=path.stat().st_size,
+                file_size_bytes=file_size,
                 **new_fields,
             )
             session.add(video)

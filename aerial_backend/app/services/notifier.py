@@ -6,6 +6,10 @@
   - 一个独立的后台worker(process_pending_notifications)定时轮询、批量发送
 优点：飞书接口抖动/限流不会拖慢主业务请求；失败了下一轮还会重试。
 """
+import base64
+import hashlib
+import hmac
+import time
 from datetime import datetime, timezone
 
 import httpx
@@ -33,14 +37,29 @@ def _format_message(n: Notification) -> str:
         return f"[{n.event_type}] {payload}"
 
 
+def _gen_sign(timestamp: int, secret: str) -> str:
+    """飞书自定义机器人签名算法：用"timestamp\\n密钥"当HMAC-SHA256的key，
+    对空内容求HMAC，结果再base64。跟飞书官方文档给的算法一致，不是我们自己发明的。
+    参考: https://open.feishu.cn/document/ukTMukTMukTM/ucTM5YjL3ETO24yNxkjN
+    """
+    string_to_sign = f"{timestamp}\n{secret}"
+    hmac_code = hmac.new(
+        string_to_sign.encode("utf-8"), digestmod=hashlib.sha256
+    ).digest()
+    return base64.b64encode(hmac_code).decode("utf-8")
+
+
 async def send_feishu_message(text: str) -> bool:
     if not settings.feishu_webhook_url:
         return False
+    payload: dict = {"msg_type": "text", "content": {"text": text}}
+    if settings.feishu_webhook_secret:
+        # 机器人开了签名校验时必须带timestamp+sign，否则飞书直接拒收(sign match fail)
+        timestamp = int(time.time())
+        payload["timestamp"] = str(timestamp)
+        payload["sign"] = _gen_sign(timestamp, settings.feishu_webhook_secret)
     async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(
-            settings.feishu_webhook_url,
-            json={"msg_type": "text", "content": {"text": text}},
-        )
+        resp = await client.post(settings.feishu_webhook_url, json=payload)
         return resp.status_code == 200
 
 

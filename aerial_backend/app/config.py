@@ -13,6 +13,8 @@ class Settings(BaseSettings):
 
     # 飞书自定义机器人webhook地址；也可以换成飞书开放平台的应用+access_token方式
     feishu_webhook_url: str = ""
+    # 机器人开了"签名校验"才需要填，不开就留空；见 services/notifier.py 的签名逻辑
+    feishu_webhook_secret: str = ""
 
     # 校验连续失败多少次后升级提醒 ziyu/quanwei
     validation_fail_escalation_threshold: int = 3
