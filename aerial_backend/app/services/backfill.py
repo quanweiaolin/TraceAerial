@@ -8,13 +8,16 @@
 跟scanner.py共用app.services.video_metadata.extract_new_video_fields，
 避免"新视频入库"和"老视频回填"两处各写一套提取逻辑。
 """
+from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Video
+from app.models import ScanDiscovery, ScanJob, Video
 from app.services.video_metadata import extract_new_video_fields
+
+SEED_COMMIT_BATCH_SIZE = 500
 
 
 async def backfill_video_metadata(session: AsyncSession, only_missing: bool = True) -> dict:
@@ -45,3 +48,51 @@ async def backfill_video_metadata(session: AsyncSession, only_missing: bool = Tr
 
     await session.commit()
     return {"checked": checked, "updated": updated, "missing_file": missing_file}
+
+
+async def seed_scan_discoveries_from_videos(session: AsyncSession) -> dict:
+    """
+    用videos表里已有的记录反向"灌"一份scan_discoveries缓存，只跑一次即可。
+
+    背景：videos_only模式测试阶段扫过的视频，scan_discoveries表当时还不存在，
+    从来没写过缓存记录。等scan_discoveries表建好、切到完整流程(videos_only=False)
+    自动扫描时，run_scan的缓存查找(按file_path+file_size_bytes)会对这些老视频
+    全部未命中，等于把已经花了一周算完的hash全部重新算一遍。
+
+    videos表本身就存了每个视频的storage_path/file_size_bytes/sha256(当时已经
+    算好的结果)，不需要重新读文件，直接用这些数据构造scan_discoveries行即可。
+
+    幂等性：不做"已存在跳过"判断，重复跑会重复插入缓存行——不影响正确性(run_scan
+    按discovered_at取最新一条)，但没必要，正常只跑一次。
+    """
+    job = ScanJob(
+        root_path="<backfill from videos table>",
+        status="completed",
+        finished_at=datetime.now(timezone.utc),
+    )
+    session.add(job)
+    await session.flush()  # 拿到job.id
+
+    result = await session.execute(select(Video))
+    videos = result.scalars().all()
+
+    seeded = 0
+    for video in videos:
+        session.add(
+            ScanDiscovery(
+                scan_job_id=job.id,
+                file_path=video.storage_path,
+                file_size_bytes=video.file_size_bytes,
+                hash_status="done",
+                sha256=video.sha256,
+                resolved_video_sha256=video.sha256,
+                is_new_task=False,
+            )
+        )
+        seeded += 1
+        if seeded % SEED_COMMIT_BATCH_SIZE == 0:
+            await session.commit()
+
+    job.files_found = seeded
+    await session.commit()
+    return {"seeded": seeded}
