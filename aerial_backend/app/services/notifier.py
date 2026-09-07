@@ -13,11 +13,11 @@ import time
 from datetime import datetime, timezone
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models import Notification
+from app.models import Notification, Video
 
 MAX_RETRY = 5
 
@@ -86,6 +86,39 @@ async def process_pending_notifications(session: AsyncSession, batch_size: int =
 
     await session.commit()
     return len(pending)
+
+
+async def send_daily_summary(session: AsyncSession) -> None:
+    """每日汇总，由定时任务(比如每天早上)调用一次。目前统计3项：
+      - 今日新增视频数
+      - 其中时长<10s的短视频数(duration_seconds为空的不算，ffprobe没读出来的另算)
+      - 其中缺经纬度的数量(collect_lon/collect_lat任意一个为空就算，代表没有
+        SRT文件或者SRT解析失败，任意一个缺了都算)
+    以后要加新指标，在这个函数里加一个 func.count().filter(...) 列即可，
+    不用改调用方(app/main.py的定时任务)。
+    """
+    today_start = func.date_trunc("day", func.now())
+
+    new_count = func.count().filter(Video.created_at >= today_start)
+    short_count = func.count().filter(
+        Video.created_at >= today_start,
+        Video.duration_seconds.is_not(None),
+        Video.duration_seconds < 10,
+    )
+    no_gps_count = func.count().filter(
+        Video.created_at >= today_start,
+        or_(Video.collect_lon.is_(None), Video.collect_lat.is_(None)),
+    )
+
+    result = await session.execute(select(new_count, short_count, no_gps_count))
+    new_total, short_total, no_gps_total = result.one()
+
+    lines = ["📊 每日视频汇总", f"今日新增视频: {new_total} 个"]
+    if short_total:
+        lines.append(f"⚠️ 其中时长<10s的短视频: {short_total} 个")
+    if no_gps_total:
+        lines.append(f"⚠️ 其中缺经纬度(疑似无SRT/解析失败): {no_gps_total} 个")
+    await send_feishu_message("\n".join(lines))
 
 
 async def enqueue_validation_escalation(
