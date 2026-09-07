@@ -44,14 +44,10 @@ app.include_router(videos.router)
 
 
 @app.post("/scan/trigger")
-async def trigger_scan_now(root_path: str, videos_only: bool = False):
-    """手动触发一次扫盘，不用等定时任务，方便调试/临时导入一批数据。
-
-    videos_only=True: 数据库还没建全表(scan_jobs/scan_discoveries/notifications)时，
-    只写videos表用于测试，见 services/scanner.run_scan 的说明。
-    """
+async def trigger_scan_now(root_path: str):
+    """手动触发一次扫盘，不用等定时任务，方便调试/临时导入一批数据。"""
     async with SessionContext() as session:
-        job = await run_scan(session, root_path, videos_only=videos_only)
+        job = await run_scan(session, root_path)
     return {
         "job_id": job.id,
         "files_found": job.files_found,

@@ -26,21 +26,25 @@ VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
 COMMIT_BATCH_SIZE = 100  # 每处理这么多个文件落库一次，避免大目录跑到一半被杀/OOM全部白扫
 
 
-async def run_scan(session: AsyncSession, root_path: str, videos_only: bool = False) -> ScanJob:
+async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
     """
-    videos_only=True: 【临时测试开关】数据库还没建全表(scan_jobs/scan_discoveries/
-    notifications)时，手动测扫盘只写videos表用。
-    效果：ScanJob/ScanDiscovery/Notification这三类对象只在内存里用来算计数，
-    不调用session.add()，commit时就不会往这3张(还没建的)表写数据；
-    只有Video对象会被add()，最终只有videos表会被真正落库。
+    完整流程，需要scan_jobs/scan_discoveries/notifications三张表已建好(建表SQL见
+    enable_scan_pipeline.sql)。
 
-    等这3张表建好后，调用方直接不传这个参数(默认False)即可恢复完整流程，
-    这段代码不用再改。
+    ------------------------------------------------------------------
+    【历史记录，供以后需要时参考，不是活代码】
+    早期这几张表还没建的阶段，这个函数有一个 videos_only: bool = False 参数：
+    传True时，ScanJob/ScanDiscovery/Notification只在内存里用来算计数、不
+    session.add()，commit时就只有Video会真正落库，用于绕开还没建的表手动测
+    "扫盘写videos表"这一步。三张表建好、切回默认参数后就不再需要了。
+    如果以后又出现"部分表还没建，想只测videos这一步"的场景，可以从git历史
+    找回这段逻辑：`git show 08b1c36:aerial_backend/app/services/scanner.py`
+    (或更早的 70162d1/2c04b21)。
+    ------------------------------------------------------------------
     """
     job = ScanJob(root_path=root_path)
-    if not videos_only:
-        session.add(job)
-        await session.flush()  # 拿到job.id
+    session.add(job)
+    await session.flush()  # 拿到job.id
 
     files_found = files_new = files_duplicate = 0
 
@@ -55,29 +59,25 @@ async def run_scan(session: AsyncSession, root_path: str, videos_only: bool = Fa
         # 不重新读整个文件。判断依据只用路径+大小，不含mtime——够用且没有额外
         # 表结构成本，适合"归档只增不改"的场景；如果文件曾被原地替换成同样大小
         # 的不同内容，这里会误判成"没变"，目前认为概率低到可以接受。
-        cached_sha256 = None
-        if not videos_only:
-            cache_result = await session.execute(
-                select(ScanDiscovery.sha256)
-                .where(ScanDiscovery.file_path == str(path))
-                .where(ScanDiscovery.file_size_bytes == file_size)
-                .where(ScanDiscovery.hash_status == "done")
-                .order_by(ScanDiscovery.discovered_at.desc())
-                .limit(1)
-            )
-            cached_sha256 = cache_result.scalar_one_or_none()
+        cache_result = await session.execute(
+            select(ScanDiscovery.sha256)
+            .where(ScanDiscovery.file_path == str(path))
+            .where(ScanDiscovery.file_size_bytes == file_size)
+            .where(ScanDiscovery.hash_status == "done")
+            .order_by(ScanDiscovery.discovered_at.desc())
+            .limit(1)
+        )
+        cached_sha256 = cache_result.scalar_one_or_none()
 
-        discovery = None
-        if not videos_only:
-            discovery = ScanDiscovery(
-                scan_job_id=job.id,
-                file_path=str(path),
-                file_size_bytes=file_size,
-                hash_status="done" if cached_sha256 is not None else "hashing",
-                sha256=cached_sha256,
-            )
-            session.add(discovery)
-            await session.flush()
+        discovery = ScanDiscovery(
+            scan_job_id=job.id,
+            file_path=str(path),
+            file_size_bytes=file_size,
+            hash_status="done" if cached_sha256 is not None else "hashing",
+            sha256=cached_sha256,
+        )
+        session.add(discovery)
+        await session.flush()
 
         if cached_sha256 is not None:
             digest = cached_sha256
@@ -85,14 +85,12 @@ async def run_scan(session: AsyncSession, root_path: str, videos_only: bool = Fa
             try:
                 digest = compute_sha256(path)
             except OSError as e:
-                if discovery is not None:
-                    discovery.hash_status = "error"
-                    discovery.error_message = str(e)
+                discovery.hash_status = "error"
+                discovery.error_message = str(e)
                 continue
 
-            if discovery is not None:
-                discovery.sha256 = digest
-                discovery.hash_status = "done"
+            discovery.sha256 = digest
+            discovery.hash_status = "done"
 
         existing = await session.get(Video, digest)
         if existing is None:
@@ -111,29 +109,24 @@ async def run_scan(session: AsyncSession, root_path: str, videos_only: bool = Fa
             )
             session.add(video)
             files_new += 1
-            if discovery is not None:
-                discovery.is_new_task = True
-            if not videos_only:  # notifications表未建时跳过，videos_only模式下不发通知
-                session.add(
-                    Notification(
-                        video_sha256=digest,
-                        event_type="new_task",
-                        channel="feishu",
-                        payload={"file_path": str(path), "original_name": path.name},
-                    )
+            discovery.is_new_task = True
+            session.add(
+                Notification(
+                    video_sha256=digest,
+                    event_type="new_task",
+                    channel="feishu",
+                    payload={"file_path": str(path), "original_name": path.name},
                 )
+            )
         else:
             files_duplicate += 1
-            if discovery is not None:
-                discovery.is_new_task = False
+            discovery.is_new_task = False
 
-        if discovery is not None:
-            discovery.resolved_video_sha256 = digest
+        discovery.resolved_video_sha256 = digest
 
         # 每处理满COMMIT_BATCH_SIZE个文件落库一次，而不是等全部扫完才提交：
         # 1) 大目录跑到一半被杀(OOM/tmux没了)，已经处理过的视频不会白扫
         # 2) 已提交对象会被session释放，内存不会随扫描进度一直往上涨
-        # job的计数在videos_only模式下不会真的落库(job没add过)，这里赋值无副作用
         job.files_found = files_found
         job.files_new = files_new
         job.files_duplicate = files_duplicate
