@@ -123,6 +123,9 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
                 **new_fields,
             )
             session.add(video)
+            await session.flush()  # 必须在这里flush，确保video先落库，
+            # 不然下面Notification.video_sha256(外键指向videos.sha256)可能
+            # 在同一次自动flush里insert顺序不对，报FK违反(见2026-09-07的事故)
             files_new += 1
             discovery.is_new_task = True
 
