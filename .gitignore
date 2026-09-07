@@ -20,3 +20,5 @@ venv/
 *.tmp
 
 .omc/
+
+checkpoints/
