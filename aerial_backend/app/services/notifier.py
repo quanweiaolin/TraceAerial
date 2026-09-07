@@ -28,6 +28,7 @@ def _format_message(n: Notification) -> str:
         "new_task": "🆕 新视频入库，请及时认领处理：{file_path}",
         "stage_failed": "❌ 阶段处理失败：视频 {video} 在阶段 {stage} 出错：{error}",
         "validation_escalation": "⚠️ {username} 连续 {count} 次数据提交校验失败，请协助确认",
+        "qa_batch_ready": "🔍 新一批检测QA待标注，共 {count} 个视频，请及时处理",
     }
     payload = n.payload or {}
     template = templates.get(n.event_type, "{payload}")
