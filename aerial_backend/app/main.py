@@ -7,6 +7,7 @@
       3) 每天一次的数据库汇总(新增视频数/短视频/缺经纬度)
       4) 每天一次的VRU检测QA批次(最新一天collect的视频)，有新一批就发飞书通知
 """
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import date
 
@@ -58,7 +59,11 @@ async def _run_qa_batch(collect_date: date | None, only_latest_date: bool, notif
         if not candidates:
             return {"processed": 0, "failed": [], "results": []}
 
-        stats = run_detection_batch(
+        # run_detection_batch是同步阻塞函数(跑模型推理)，直接await会卡住整个
+        # asyncio事件循环——扫盘/飞书通知等其他定时任务、别的HTTP请求都会被卡住
+        # 直到这批跑完。丢进线程池执行，不阻塞事件循环。
+        stats = await asyncio.to_thread(
+            run_detection_batch,
             candidates,
             model_path=settings.vru_model_path,
             model_name=settings.vru_model_name,
