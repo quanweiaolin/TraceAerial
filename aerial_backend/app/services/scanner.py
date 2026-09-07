@@ -5,8 +5,12 @@
   1. 遍历 root_path 下的视频文件 -> 写 scan_discoveries(pending)
   2. 逐个算sha256 -> 更新 hash_status=done, 填sha256
   3. 查 videos 表：
-     - 不存在该sha256 -> 这是"新数据" -> INSERT videos，is_new_task=True，
-       并给 notifications 插一条 new_task 通知
+     - 不存在该sha256:
+         - 同一storage_path没有活着的旧记录 -> 真新视频 -> INSERT videos，
+           is_new_task=True，发 new_task 即时通知
+         - 同一storage_path有活着的旧记录(sha256不同) -> 原地重新编码(长期瘦身
+           转码任务)，不是新视频 -> 旧记录deleted_at软删除下线，新记录
+           replaces_sha256指回旧sha256，不发即时通知(走每日汇总统计)
      - 已存在 -> 只关联 resolved_video_sha256，is_new_task=False，不重复建任务
        (同一内容换了路径/被复制，不应该产生第二条任务流)
 
@@ -94,8 +98,18 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
 
         existing = await session.get(Video, digest)
         if existing is None:
-            # 真新增：insert videos 会触发DB里 trg_init_pipeline_status(若已建)，
-            # 自动为它生成8个阶段的pending状态行；触发器还没建时这一步只是单纯insert
+            # 新sha256，但可能不是"全新视频"——如果同一个storage_path上已经有
+            # 一条还活着(deleted_at IS NULL)的旧记录，说明是原地重新编码(长期
+            # 瘦身转码任务)覆盖了同一份文件，不是真新视频。videos.storage_path
+            # 上有WHERE deleted_at IS NULL的唯一索引，旧记录不软删除的话下面
+            # insert会直接报错。
+            old_active_result = await session.execute(
+                select(Video)
+                .where(Video.storage_path == str(path))
+                .where(Video.deleted_at.is_(None))
+            )
+            old_active = old_active_result.scalar_one_or_none()
+            is_re_encode = old_active is not None
 
             # 技术元数据(时长/分辨率/帧率/编码/collected_at)+GPS：ffprobe只读文件头，
             # 不会像sha256那样耗时；device_id/collected_by保持不变，本次不处理
@@ -105,19 +119,28 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
                 original_name=path.name,
                 storage_path=str(path),
                 file_size_bytes=file_size,
+                replaces_sha256=old_active.sha256 if is_re_encode else None,
                 **new_fields,
             )
             session.add(video)
             files_new += 1
             discovery.is_new_task = True
-            session.add(
-                Notification(
-                    video_sha256=digest,
-                    event_type="new_task",
-                    channel="feishu",
-                    payload={"file_path": str(path), "original_name": path.name},
+
+            if is_re_encode:
+                # 旧记录软删除下线，不物理删除，历史数据还在；不发即时飞书通知，
+                # 走每日汇总(services/notifier.send_daily_summary)统计"今日更新了多少视频"
+                old_active.deleted_at = datetime.now(timezone.utc)
+            else:
+                # 真新增：insert videos 会触发DB里 trg_init_pipeline_status(若已建)，
+                # 自动为它生成8个阶段的pending状态行；触发器还没建时这一步只是单纯insert
+                session.add(
+                    Notification(
+                        video_sha256=digest,
+                        event_type="new_task",
+                        channel="feishu",
+                        payload={"file_path": str(path), "original_name": path.name},
+                    )
                 )
-            )
         else:
             files_duplicate += 1
             discovery.is_new_task = False

@@ -68,6 +68,12 @@ class Video(Base):
     collected_by: Mapped[int | None] = mapped_column(ForeignKey("operators.id"))
     collect_lon: Mapped[float | None]
     collect_lat: Mapped[float | None]
+    # 同一个storage_path上的视频被重新编码(比如瘦身转码)会产生新sha256；
+    # 这个自引用字段指回被替代的旧sha256，旧记录靠deleted_at软删除下线，
+    # 保留血缘方便追溯"这个位置的视频历史上有过哪些版本"。见scanner.py处理逻辑。
+    replaces_sha256: Mapped[bytes | None] = mapped_column(
+        LargeBinary(32), ForeignKey("videos.sha256")
+    )
     remark: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

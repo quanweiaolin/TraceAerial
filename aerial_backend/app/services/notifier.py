@@ -89,11 +89,13 @@ async def process_pending_notifications(session: AsyncSession, batch_size: int =
 
 
 async def send_daily_summary(session: AsyncSession) -> None:
-    """每日汇总，由定时任务(比如每天早上)调用一次。目前统计3项：
-      - 今日新增视频数
+    """每日汇总，由定时任务(比如每天早上)调用一次。目前统计4项：
+      - 今日新增视频数(含真新视频和重新编码产生的新记录，即下面第4项的父集)
       - 其中时长<10s的短视频数(duration_seconds为空的不算，ffprobe没读出来的另算)
       - 其中缺经纬度的数量(collect_lon/collect_lat任意一个为空就算，代表没有
         SRT文件或者SRT解析失败，任意一个缺了都算)
+      - 其中"重新编码更新"的数量(replaces_sha256不为空，即长期瘦身转码任务
+        产生的记录，不是真新视频；这类不发即时通知，只在这里汇总)
     以后要加新指标，在这个函数里加一个 func.count().filter(...) 列即可，
     不用改调用方(app/main.py的定时任务)。
     """
@@ -109,11 +111,19 @@ async def send_daily_summary(session: AsyncSession) -> None:
         Video.created_at >= today_start,
         or_(Video.collect_lon.is_(None), Video.collect_lat.is_(None)),
     )
+    re_encoded_count = func.count().filter(
+        Video.created_at >= today_start,
+        Video.replaces_sha256.is_not(None),
+    )
 
-    result = await session.execute(select(new_count, short_count, no_gps_count))
-    new_total, short_total, no_gps_total = result.one()
+    result = await session.execute(
+        select(new_count, short_count, no_gps_count, re_encoded_count)
+    )
+    new_total, short_total, no_gps_total, re_encoded_total = result.one()
 
     lines = ["📊 每日视频汇总", f"今日新增视频: {new_total} 个"]
+    if re_encoded_total:
+        lines.append(f"🔄 其中重新编码更新(瘦身转码): {re_encoded_total} 个")
     if short_total:
         lines.append(f"⚠️ 其中时长<10s的短视频: {short_total} 个")
     if no_gps_total:
