@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     # 扫盘根目录，多个用逗号分隔，也可以在触发扫盘接口时临时指定
     scan_roots: list[str] = []
 
+    # VRU检测QA可视化用的模型，依赖版本确认前留空——留空时定时/手动任务会跳过
+    # 不报错，见 services/vru_detection.py
+    vru_model_path: str = ""
+    vru_model_name: str = ""
+    vru_model_version: str = ""
+
     # 数据库连接池
     db_pool_size: int = 10
     db_max_overflow: int = 10

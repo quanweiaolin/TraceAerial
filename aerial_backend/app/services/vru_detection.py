@@ -59,26 +59,36 @@ def compute_processing_dir(storage_path: str) -> Path:
 
 
 async def select_candidate_videos(
-    session: AsyncSession, collect_date: date | None = None
+    session: AsyncSession,
+    collect_date: date | None = None,
+    only_latest_date: bool = True,
 ) -> list[Video]:
-    """挑候选视频：collect_date=None时默认用videos表里最新的collected_at日期。
-    只返回Processing目录下还没有Test文件夹的(幂等，已经生成过的不会重复选中)。
-    按storage_path排序，保证多次运行时候选顺序稳定，配合固定的随机种子。
+    """挑候选视频，只返回Processing目录下还没有Test文件夹的(幂等，已经生成过的
+    不会重复选中)。按storage_path排序，保证多次运行时候选顺序稳定，配合固定的
+    随机种子。
+
+    三种用法：
+      - collect_date给了具体日期 -> 只挑那一天
+      - collect_date=None, only_latest_date=True(默认) -> 挑videos表里最新的
+        collected_at那一天，给定时任务用("有新数据了")
+      - collect_date=None, only_latest_date=False -> 不限日期，挑所有还没有
+        Test文件夹的视频，给手动"清洗已有数据"用
     """
-    if collect_date is None:
+    stmt = select(Video).where(Video.deleted_at.is_(None))
+
+    if collect_date is not None:
+        stmt = stmt.where(func.date_trunc("day", Video.collected_at) == collect_date)
+    elif only_latest_date:
         max_date_result = await session.execute(
             select(func.date_trunc("day", func.max(Video.collected_at)))
         )
-        collect_date = max_date_result.scalar_one_or_none()
-        if collect_date is None:
+        latest_date = max_date_result.scalar_one_or_none()
+        if latest_date is None:
             return []
+        stmt = stmt.where(func.date_trunc("day", Video.collected_at) == latest_date)
+    # else: only_latest_date=False 且没给collect_date -> 不加日期条件，全表候选
 
-    result = await session.execute(
-        select(Video)
-        .where(func.date_trunc("day", Video.collected_at) == collect_date)
-        .where(Video.deleted_at.is_(None))
-        .order_by(Video.storage_path)
-    )
+    result = await session.execute(stmt.order_by(Video.storage_path))
     videos = result.scalars().all()
 
     candidates = []
