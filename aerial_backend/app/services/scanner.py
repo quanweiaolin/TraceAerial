@@ -16,6 +16,7 @@
 
 可以由 APScheduler 定时调用，也可以挂在 FastAPI 的 POST /scan/trigger 接口里异步跑。
 """
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -87,7 +88,10 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
             digest = cached_sha256
         else:
             try:
-                digest = compute_sha256(path)
+                # compute_sha256是同步阻塞IO(读整个视频文件)，直接调用会卡住
+                # 整个asyncio事件循环，导致同一进程里其他协程(比如每分钟一次的
+                # scheduled_notify)被拖慢甚至"missed"。丢进线程池执行。
+                digest = await asyncio.to_thread(compute_sha256, path)
             except OSError as e:
                 discovery.hash_status = "error"
                 discovery.error_message = str(e)
@@ -112,8 +116,9 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
             is_re_encode = old_active is not None
 
             # 技术元数据(时长/分辨率/帧率/编码/collected_at)+GPS：ffprobe只读文件头，
-            # 不会像sha256那样耗时；device_id/collected_by保持不变，本次不处理
-            new_fields = extract_new_video_fields(path)
+            # 不会像sha256那样耗时；但内部调subprocess仍是阻塞调用，同样丢线程池，
+            # 不占用事件循环；device_id/collected_by保持不变，本次不处理
+            new_fields = await asyncio.to_thread(extract_new_video_fields, path)
             video = Video(
                 sha256=digest,
                 original_name=path.name,
