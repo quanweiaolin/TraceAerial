@@ -92,10 +92,11 @@ async def scheduled_qa_batch() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     scheduler.add_job(scheduled_scan, "interval", hours=1, id="scan")
-    scheduler.add_job(scheduled_notify, "interval", minutes=1, id="notify")
+    # scheduler.add_job(scheduled_notify, "interval", hours=1, id="notify")
     # 每天早上9点发一次汇总；具体统计口径见 services/notifier.send_daily_summary，
     # 后续要加新指标只用改那个函数，这里的调度不用动
     scheduler.add_job(scheduled_daily_summary, "cron", hour=9, minute=0, id="daily_summary")
+    # scheduler.add_job(scheduled_daily_summary, "interval", minutes=1, id="daily_summary")
     # 放在daily_summary之前跑，避免俩任务撞同一分钟
     scheduler.add_job(scheduled_qa_batch, "cron", hour=8, minute=30, id="qa_batch")
     # 放在daily_summary前，让当天GPS缺失的视频有机会先补上再统计
