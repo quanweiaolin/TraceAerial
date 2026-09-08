@@ -8,10 +8,11 @@
 跟scanner.py共用app.services.video_metadata.extract_new_video_fields，
 避免"新视频入库"和"老视频回填"两处各写一套提取逻辑。
 """
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import ScanDiscovery, ScanJob, Video
@@ -22,15 +23,24 @@ SEED_COMMIT_BATCH_SIZE = 500
 
 async def backfill_video_metadata(session: AsyncSession, only_missing: bool = True) -> dict:
     """
-    only_missing=True(默认): 只处理 duration_seconds IS NULL 的行，
-        跑第二次是幂等的(已经补上的行不会重复处理)。
+    only_missing=True(默认): 只处理 duration_seconds 或 collect_lon/collect_lat
+        缺失的行，跑第二次是幂等的(已经补上的行不会重复处理)。collect_lon/lat
+        缺失也要重新跑一遍的原因：扫盘时如果视频文件已经复制完但同名.srt还没
+        复制完(拷贝顺序不一定同步)，当时会判定"没有srt"，GPS永远缺失——这个
+        函数重新跑一遍能捕捉到"当时没有、现在已经有了"的srt文件。
     only_missing=False: 对所有视频强制重新提取一遍(比如提取逻辑升级后想全量刷新)。
 
     文件在storage_path对应位置已经找不到时跳过并计数，不中断整体回填。
     """
     stmt = select(Video)
     if only_missing:
-        stmt = stmt.where(Video.duration_seconds.is_(None))
+        stmt = stmt.where(
+            or_(
+                Video.duration_seconds.is_(None),
+                Video.collect_lon.is_(None),
+                Video.collect_lat.is_(None),
+            )
+        )
     result = await session.execute(stmt)
     videos = result.scalars().all()
 
@@ -42,7 +52,11 @@ async def backfill_video_metadata(session: AsyncSession, only_missing: bool = Tr
             missing_file += 1
             continue
 
-        for field, value in extract_new_video_fields(path).items():
+        # extract_new_video_fields内部调用ffprobe(subprocess)+读srt文件，是
+        # 同步阻塞调用，丢线程池执行，不阻塞事件循环(尤其是这个函数现在会被
+        # 定时任务周期性调用，见app/main.py)
+        new_fields = await asyncio.to_thread(extract_new_video_fields, path)
+        for field, value in new_fields.items():
             setattr(video, field, value)
         updated += 1
 
