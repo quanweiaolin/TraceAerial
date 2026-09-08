@@ -10,7 +10,9 @@ import base64
 import hashlib
 import hmac
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 from sqlalchemy import func, or_, select
@@ -64,8 +66,22 @@ async def send_feishu_message(text: str) -> bool:
         return resp.status_code == 200
 
 
+def _mark_sent_or_retry(n: Notification, ok: bool) -> None:
+    if ok:
+        n.status = "sent"
+        n.sent_at = datetime.now(timezone.utc)
+    else:
+        n.retry_count += 1
+        if n.retry_count >= MAX_RETRY:
+            n.status = "failed"
+
+
 async def process_pending_notifications(session: AsyncSession, batch_size: int = 50) -> int:
-    """由定时任务(比如每分钟)调用一次，返回本次处理的条数。"""
+    """由定时任务(比如每分钟)调用一次，返回本次处理的条数。
+
+    new_task这类通知按"视频所在的直接父文件夹"分组合并成一条消息发送，
+    避免一次扫盘发现一堆新视频时逐条刷屏；其他event_type照常逐条发送。
+    """
     result = await session.execute(
         select(Notification)
         .where(Notification.status == "pending")
@@ -74,16 +90,25 @@ async def process_pending_notifications(session: AsyncSession, batch_size: int =
     )
     pending = result.scalars().all()
 
-    for n in pending:
+    new_task_notifications = [n for n in pending if n.event_type == "new_task"]
+    other_notifications = [n for n in pending if n.event_type != "new_task"]
+
+    groups: dict[str, list[Notification]] = defaultdict(list)
+    for n in new_task_notifications:
+        file_path = (n.payload or {}).get("file_path", "")
+        folder = str(Path(file_path).parent) if file_path else "(未知路径)"
+        groups[folder].append(n)
+
+    for folder, group in groups.items():
+        text = f"🆕 新视频入库，请及时认领处理\n📁 {folder}\n共 {len(group)} 个视频"
+        ok = await send_feishu_message(text)
+        for n in group:
+            _mark_sent_or_retry(n, ok)
+
+    for n in other_notifications:
         text = _format_message(n)
         ok = await send_feishu_message(text)
-        if ok:
-            n.status = "sent"
-            n.sent_at = datetime.now(timezone.utc)
-        else:
-            n.retry_count += 1
-            if n.retry_count >= MAX_RETRY:
-                n.status = "failed"
+        _mark_sent_or_retry(n, ok)
 
     await session.commit()
     return len(pending)

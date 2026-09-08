@@ -6,6 +6,8 @@
       2) 定时发送 notifications 队列里的飞书消息 (比如每分钟)
       3) 每天一次的数据库汇总(新增视频数/短视频/缺经纬度)
       4) 每天一次的VRU检测QA批次(最新一天collect的视频)，有新一批就发飞书通知
+      5) 每天一次的元数据补全(duration/GPS缺失的视频重新提取一遍，主要用来
+         补"扫盘时SRT文件还没复制完"导致的GPS缺失)
 """
 import asyncio
 from contextlib import asynccontextmanager
@@ -17,6 +19,7 @@ from fastapi import FastAPI
 from app.api.routers import videos
 from app.config import settings
 from app.db import SessionContext
+from app.services.backfill import backfill_video_metadata
 from app.services.notifier import process_pending_notifications, send_daily_summary
 from app.services.scanner import run_scan
 from app.services.vru_detection import (
@@ -42,6 +45,13 @@ async def scheduled_notify() -> None:
 async def scheduled_daily_summary() -> None:
     async with SessionContext() as session:
         await send_daily_summary(session)
+
+
+async def scheduled_metadata_backfill() -> None:
+    """跑在daily_summary之前，让当天被SRT晚到影响的"缺经纬度"视频有机会在
+    汇总统计前补上，daily_summary里的缺经纬度数字会因此自然变小。"""
+    async with SessionContext() as session:
+        await backfill_video_metadata(session, only_missing=True)
 
 
 async def _run_qa_batch(collect_date: date | None, only_latest_date: bool, notify: bool) -> dict:
@@ -88,6 +98,10 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(scheduled_daily_summary, "cron", hour=9, minute=0, id="daily_summary")
     # 放在daily_summary之前跑，避免俩任务撞同一分钟
     scheduler.add_job(scheduled_qa_batch, "cron", hour=8, minute=30, id="qa_batch")
+    # 放在daily_summary前，让当天GPS缺失的视频有机会先补上再统计
+    scheduler.add_job(
+        scheduled_metadata_backfill, "cron", hour=8, minute=45, id="metadata_backfill"
+    )
     scheduler.start()
     yield
     scheduler.shutdown()
