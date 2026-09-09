@@ -56,6 +56,11 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
     for path in Path(root_path).rglob("*"):
         if not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS:
             continue
+        if path.name.startswith("._"):
+            # macOS拷贝到非HFS+文件系统(NAS的exFAT/SMB/NFS)时自动生成的
+            # AppleDouble元数据"影子"文件，体积很小(常见4096字节)，跟真实
+            # 视频内容无关，不是"正在上传中"——直接跳过，不算files_found
+            continue
         files_found += 1
         print(f"scanning: {path}")
         file_size = path.stat().st_size
