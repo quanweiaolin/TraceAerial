@@ -62,7 +62,7 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
             # 视频内容无关，不是"正在上传中"——直接跳过，不算files_found
             continue
         files_found += 1
-        print(f"scanning: {path}")
+        # print(f"scanning: {path}")
         file_size = path.stat().st_size
 
         # 缓存命中：之前扫过同路径+同大小的文件、且hash算完了，直接复用sha256，
