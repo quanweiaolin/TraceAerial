@@ -30,5 +30,5 @@
 
 ## 子模块文档
 
-- VRU检测QA可视化审核（学生开发指南）：[aerial_backend/VRU_STUDENT_GUIDE.md](aerial_backend/VRU_STUDENT_GUIDE.md)
+- VRU检测QA可视化审核（学生开发指南）：[aerial_backend/README/DETTEST_STUDENT_GUIDE.md](aerial_backend/README/DETTEST_STUDENT_GUIDE.md)
 

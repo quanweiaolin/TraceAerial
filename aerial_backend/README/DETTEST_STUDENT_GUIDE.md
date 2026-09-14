@@ -155,3 +155,121 @@ checkpoints/*.pt   （.gitignore已排除，不进仓库）
   这样"的问题，先问，不要自己决定。
 - commit信息写清楚改了什么、为什么改，参考仓库里已有的commit记录风格。
 - 涉及生产环境配置（`.env`真实值、NAS路径权限）的事情不要自己处理，找我们。
+
+## 8. 怎么使用和测试
+
+**⚠️ FastAPI服务必须启动着，才能测接口/测审核页面。** 下面第8.2节往后的每一步，
+只要涉及 `curl`、浏览器打开页面，前提都是服务在跑。第8.1节（脱离服务的纯脚本
+验证）例外，不需要服务启动。
+
+### 8.1 启动服务
+
+```bash
+cd aerial_backend
+uv sync                        # 第一次跑/依赖有更新时执行
+uv run uvicorn app.main:app --host 0.0.0.0 --port 8088
+```
+
+本地临时调试可以就这样前台跑着（看得到实时日志，方便调试）。如果要让它
+长期挂着不随终端关闭而退出，用 `tmux`：
+
+```bash
+tmux new -s aerial
+cd aerial_backend
+uv run uvicorn app.main:app --host 0.0.0.0 --port 8088
+# 看到 "Uvicorn running on http://0.0.0.0:8088" 之后
+# 按 Ctrl+B 松开再按 D，分离session（不要直接关窗口/Ctrl+C，那样进程会被杀掉）
+```
+
+改完代码要重新测，`Ctrl+C` 停掉旧进程，重新执行 `uv run uvicorn ...` 才会生效
+（改Python代码不会热加载，除非加 `--reload` 参数，仅本地调试用，生产环境不要
+用 `--reload`）。
+
+### 8.2 确认服务活着
+
+```bash
+curl http://127.0.0.1:8088/qa/models
+```
+
+能返回一段JSON（模型文件列表）说明服务正常。如果报 `curl: (7) Failed to
+connect`，说明服务根本没启动，回第8.1节先把服务跑起来，别的都别测。
+
+### 8.3 分层测试，从小到大
+
+**第一层：不碰数据库/不碰服务，纯验证模型本身能跑**（这一步不需要服务启动）：
+
+```bash
+uv run python -c "
+import cv2
+from ultralytics import YOLO
+import torch
+
+print('CUDA可用:', torch.cuda.is_available())
+model = YOLO('checkpoints/best_vru_universal.pt')
+print('模型类别:', model.names)
+print('任务类型:', model.task)
+"
+```
+
+出错就在这一层解决（CUDA探测失败、模型文件路径不对等），不要带着数据库/
+服务一起排查。
+
+**第二层：直接脚本调用核心函数，跳过HTTP，看真实报错栈**（这一步也不需要
+服务启动，因为是直接跑Python脚本，不经过FastAPI）：
+
+```bash
+uv run python -c "
+import asyncio
+from app.db import SessionContext
+from app.services.vru_detection import select_candidate_videos, run_detection_batch
+
+async def main():
+    async with SessionContext() as session:
+        candidates = await select_candidate_videos(session, only_latest_date=True, limit=2)
+        print(f'候选视频数: {len(candidates)}')
+        stats = run_detection_batch(
+            candidates,
+            model_path='checkpoints/best_vru_universal.pt',
+            model_name='vru_universal',
+            model_version='v1',
+        )
+        print(stats)
+
+asyncio.run(main())
+"
+```
+
+跑完去 `stats` 里打印出来的 `test_dir` 路径下 `ls` 一下，确认图片真的生成了。
+
+**第三层：走真实的HTTP接口，这一步开始必须先启动服务**（见8.1）：
+
+```bash
+# 小范围测试：只测某一天的前N个视频，notify=false避免刷飞书群
+curl -X POST "http://127.0.0.1:8088/qa/run-batch?collect_date=2026-08-01&limit=10&notify=false"
+```
+
+返回 `{"processed": N, "failed": [...], "results": [...]}`。**注意**：如果这批
+视频之前已经成功跑过一次，`processed` 会是 `0`——这是设计如此（已经有`Test`
+文件夹的视频不会重复处理），不是bug，不用慌。
+
+### 8.4 打开审核页面看结果（必须服务在跑）
+
+浏览器直接打开：
+
+```
+http://<服务器地址>:8088/qa/review
+```
+
+前提是第8.3节第三层已经成功跑出过至少一批结果，不然页面是空的（"批次"
+下拉框没有可选日期）。
+
+### 8.5 常见问题排查
+
+| 现象 | 原因 | 怎么办 |
+|---|---|---|
+| `curl: (7) Failed to connect` | 服务没启动/被杀了 | 回8.1重新启动 |
+| `/qa/run-batch` 返回 `{"processed":0,...}` | 幂等设计：这批视频已经有`Test`文件夹了，不是bug | 换一批没处理过的视频测，或者确认这本来就是预期结果 |
+| `/qa/run-batch` 返回 `{"skipped": "vru_model_path not configured"}` | `.env`里`AERIAL_VRU_MODEL_PATH`是空的 | 配置这个值 |
+| 审核页面图片一直显示"该模型尚未检测过此帧" | 要么是真的没检测过（点"点击检测"就行），要么是选的模型刚好是`.env`里配置的默认模型但下拉框没显示"当前默认"标记(版本对不上) | 确认选的是不是下拉框里标了"← 当前`AERIAL_VRU_MODEL_PATH`"那一项 |
+| 页面图片加载很慢/加载不出来 | 原图是4K大图，直接传给浏览器在远程/弱网环境下容易超时 | 确认走的是`/qa/thumbnail`不是`/qa/image`；第一次加载某张图会现算缩略图有点慢，属于正常，刷新一次就快了(已缓存) |
+| 改了`vru_detection.py`/`qa_review.py`代码，重启后行为没变 | 忘了真的重启进程，或者用了`--reload`但没触发 | `Ctrl+C`杀掉旧进程，重新`uv run uvicorn ...`确认启动日志时间戳是最新的 |
