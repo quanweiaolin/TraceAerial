@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from app.services.vru_detection import (
     PROCESSING_ROOT,
     detect_with_model_on_frame,
+    get_default_model_filename,
     get_or_create_thumbnail,
     list_available_models,
     list_batch_dates,
@@ -115,7 +116,7 @@ async def submit_reviews(body: SubmitReviewsIn):
 @router.get("/models")
 async def get_models():
     """列出checkpoints目录下有哪些.pt模型，前端下拉框用来选"拿哪个模型对比"。"""
-    return {"models": list_available_models()}
+    return {"models": list_available_models(), "default": get_default_model_filename()}
 
 
 class DetectRequestIn(BaseModel):
@@ -205,6 +206,7 @@ _REVIEW_PAGE_HTML = r"""<!doctype html>
 // item.compareResults里，同一模型不用重复跑。
 let currentItems = [];
 let currentModel = '';
+let defaultModelFilename = '';  // AERIAL_VRU_MODEL_PATH当前指向的文件名
 
 async function loadDates() {
   const res = await fetch('/qa/batches');
@@ -217,9 +219,13 @@ async function loadDates() {
 async function loadModels() {
   const res = await fetch('/qa/models');
   const data = await res.json();
+  defaultModelFilename = data.default || '';
   const sel = document.getElementById('modelSelect');
   sel.innerHTML = '<option value="">(批次默认)</option>' +
-    data.models.map(m => `<option value="${m}">${m}</option>`).join('');
+    data.models.map(m => {
+      const tag = m === defaultModelFilename ? ' ← 当前AERIAL_VRU_MODEL_PATH' : '';
+      return `<option value="${m}">${m}${tag}</option>`;
+    }).join('');
 }
 
 async function loadBatch(dateStr) {
@@ -238,7 +244,12 @@ function getDetectionDisplay(item, idx) {
   // 返回 {url, n_boxes, modelLabel}；批次默认模型直接用manifest里现成的，
   // 对比模式下优先用本次session已经现场检测过的缓存结果，否则按命名规则
   // 猜一个路径去试(试失败会走img的onerror占位逻辑)。
-  if (!currentModel) {
+  //
+  // 下拉框选中的模型如果正好是当前AERIAL_VRU_MODEL_PATH指向的那个文件，
+  // 直接走批次默认这条路径——不能按文件名去猜_manual后缀的文件，因为
+  // 批次默认的文件名是按AERIAL_VRU_MODEL_NAME/VERSION(人起的名字)命名的，
+  // 跟模型文件名本身不一定一样，猜了也找不到("未检测"是误报)。
+  if (!currentModel || currentModel === defaultModelFilename) {
     return {
       url: '/qa/thumbnail?path=' + encodeURIComponent(item.detection_image),
       n_boxes: item.n_boxes,

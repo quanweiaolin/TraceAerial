@@ -223,6 +223,15 @@ def list_available_models() -> list[str]:
     return sorted(p.name for p in checkpoints_dir.glob("*.pt"))
 
 
+def get_default_model_filename() -> str:
+    """当前AERIAL_VRU_MODEL_PATH指向的文件名，给前端判断"下拉框选的是不是
+    批次默认那个模型"用——是的话应该直接复用批次默认结果，不用去猜
+    _manual后缀的文件名(那套命名规则跟AERIAL_VRU_MODEL_NAME/VERSION这两个
+    "人起的名字"没有必然对应关系，猜了也找不到)。
+    """
+    return Path(settings.vru_model_path).name
+
+
 _MODEL_CACHE: dict = {}  # model_path(str) -> 已加载的YOLO实例，避免同一个模型反复加载
 
 
