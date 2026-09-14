@@ -67,6 +67,7 @@ async def select_candidate_videos(
     session: AsyncSession,
     collect_date: date | None = None,
     only_latest_date: bool = True,
+    limit: int | None = None,
 ) -> list[Video]:
     """挑候选视频，只返回Processing目录下还没有Test文件夹的(幂等，已经生成过的
     不会重复选中)。按storage_path排序，保证多次运行时候选顺序稳定，配合固定的
@@ -78,6 +79,9 @@ async def select_candidate_videos(
         collected_at那一天，给定时任务用("有新数据了")
       - collect_date=None, only_latest_date=False -> 不限日期，挑所有还没有
         Test文件夹的视频，给手动"清洗已有数据"用
+
+    limit: 只取按storage_path排序后的前N个(在"是否已有Test文件夹"过滤之前取)，
+    主要给手动小范围测试用，比如"只测某一天的前10个视频"。
     """
     stmt = select(Video).where(Video.deleted_at.is_(None))
 
@@ -93,7 +97,11 @@ async def select_candidate_videos(
         stmt = stmt.where(func.date_trunc("day", Video.collected_at) == latest_date)
     # else: only_latest_date=False 且没给collect_date -> 不加日期条件，全表候选
 
-    result = await session.execute(stmt.order_by(Video.storage_path))
+    stmt = stmt.order_by(Video.storage_path)
+    if limit is not None:
+        stmt = stmt.limit(limit)
+
+    result = await session.execute(stmt)
     videos = result.scalars().all()
 
     candidates = []

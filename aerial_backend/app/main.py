@@ -54,7 +54,12 @@ async def scheduled_metadata_backfill() -> None:
         await backfill_video_metadata(session, only_missing=True)
 
 
-async def _run_qa_batch(collect_date: date | None, only_latest_date: bool, notify: bool) -> dict:
+async def _run_qa_batch(
+    collect_date: date | None,
+    only_latest_date: bool,
+    notify: bool,
+    limit: int | None = None,
+) -> dict:
     """定时任务和手动接口共用这一份，避免两处各写一遍"选候选->跑检测->发通知"逻辑。"""
     if not settings.vru_model_path:
         # 模型依赖/路径还没确认好，先不报错，跳过即可，等配好AERIAL_VRU_MODEL_PATH再生效
@@ -65,6 +70,7 @@ async def _run_qa_batch(collect_date: date | None, only_latest_date: bool, notif
             session,
             collect_date=collect_date,
             only_latest_date=only_latest_date,
+            limit=limit,
         )
         if not candidates:
             return {"processed": 0, "failed": [], "results": []}
@@ -131,13 +137,16 @@ async def trigger_qa_batch(
     collect_date: str | None = None,
     only_latest_date: bool = False,
     notify: bool = True,
+    limit: int | None = None,
 ):
     """手动触发VRU检测QA批次，主要给前端"清洗已有数据"用：默认(only_latest_date=False)
     不限日期，把所有还没生成Test文件夹的视频都补一遍；传collect_date(如"2026-06-13")
     可以只清洗指定某一天。定时任务(scheduled_qa_batch)走的是only_latest_date=True，
     这个接口默认反过来，符合"清洗存量"这个用途。
+
+    limit: 小范围测试用，比如collect_date=2026-09-08&limit=10只测那天前10个视频。
     """
     parsed_date = date.fromisoformat(collect_date) if collect_date else None
     return await _run_qa_batch(
-        collect_date=parsed_date, only_latest_date=only_latest_date, notify=notify
+        collect_date=parsed_date, only_latest_date=only_latest_date, notify=notify, limit=limit
     )
