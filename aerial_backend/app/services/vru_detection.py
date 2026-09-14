@@ -127,7 +127,7 @@ def run_detection_batch(
     model_path: str,
     model_name: str,
     model_version: str,
-    conf: float = 0.5,
+    conf: float = 0.4,
 ) -> dict:
     """对候选视频逐个抽帧+检测，存图到各自Test/目录，返回本批统计。
 
