@@ -39,7 +39,8 @@ RAW_TO_PROCESSING_ROOTS = {
     "/mnt/Expansion/data": "/mnt/nas/ADSafety/ADSafety/Aerial_Processing_Data",
 }
 
-BATCH_MANIFEST_DIR = Path("/mnt/nas/ADSafety/ADSafety/Aerial_Processing_Data/_qa_batches")
+PROCESSING_ROOT = "/mnt/nas/ADSafety/ADSafety/Aerial_Processing_Data"
+BATCH_MANIFEST_DIR = Path(PROCESSING_ROOT) / "_qa_batches"
 
 
 def compute_processing_dir(storage_path: str) -> Path:
@@ -162,7 +163,7 @@ def run_detection_batch(
         cv2.imwrite(str(test_dir / det_name), res.plot(labels=False, conf=False))
 
         sha_hex = sha256_bytes_to_hex(video.sha256)
-        results.append({
+        item = {
             "video_sha256": sha_hex,
             "storage_path": str(video_path),
             "test_dir": str(test_dir),
@@ -172,8 +173,9 @@ def run_detection_batch(
             "detection_image": str(test_dir / det_name),
             "model_name": model_name,
             "model_version": model_version,
-        })
-        manifest_items.append({"video_sha256": sha_hex, "test_dir": str(test_dir)})
+        }
+        results.append(item)
+        manifest_items.append(item)  # 清单存完整信息，前端靠这个就能展示，不用猜文件名
 
     manifest_path = _write_batch_manifest(manifest_items)
     return {
@@ -194,6 +196,54 @@ def _write_batch_manifest(items: list[dict]) -> Path:
         encoding="utf-8",
     )
     return manifest_path
+
+
+def list_batch_dates() -> list[str]:
+    """列出有哪些批次(按日期)，供前端选择要审核哪一批。"""
+    if not BATCH_MANIFEST_DIR.is_dir():
+        return []
+    return sorted((p.stem for p in BATCH_MANIFEST_DIR.glob("*.json")), reverse=True)
+
+
+def read_batch_manifest(date_str: str) -> dict | None:
+    """读某一天的批次清单，返回run_detection_batch当时写进去的完整条目列表。"""
+    path = BATCH_MANIFEST_DIR / f"{date_str}.json"
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def review_json_path(test_dir: str, frame_idx: int, model_name: str, model_version: str) -> Path:
+    """review结果json路径，跟检测叠加图同目录、同名规则，方便肉眼对应。"""
+    return Path(test_dir) / f"raw_f{frame_idx}_{model_name}_{model_version}_review.json"
+
+
+def read_review(test_dir: str, frame_idx: int, model_name: str, model_version: str) -> dict | None:
+    """读一条review结果，没标注过返回None。"""
+    path = review_json_path(test_dir, frame_idx, model_name, model_version)
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_review(
+    test_dir: str,
+    frame_idx: int,
+    model_name: str,
+    model_version: str,
+    verdict: str,
+    reviewed_by: str | None = None,
+    note: str = "",
+) -> None:
+    """写一条review结果。verdict目前用"pass"/"fail"两种取值。"""
+    path = review_json_path(test_dir, frame_idx, model_name, model_version)
+    data = {
+        "verdict": verdict,
+        "reviewed_by": reviewed_by,
+        "reviewed_at": datetime.now(timezone.utc).isoformat(),
+        "note": note,
+    }
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 async def enqueue_qa_batch_notification(session: AsyncSession, count: int) -> None:

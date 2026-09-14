@@ -16,7 +16,7 @@ from datetime import date
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
 
-from app.api.routers import videos
+from app.api.routers import qa_review, videos
 from app.config import settings
 from app.db import SessionContext
 from app.services.backfill import backfill_video_metadata
@@ -110,6 +110,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Aerial Video Data Management", lifespan=lifespan)
 app.include_router(videos.router)
+app.include_router(qa_review.router)
 
 
 @app.post("/scan/trigger")
