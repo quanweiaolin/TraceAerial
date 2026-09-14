@@ -121,6 +121,37 @@ def _count_boxes(res) -> int:
     return 0
 
 
+# 检测框颜色，BGR格式(cv2的通道顺序)，默认亮黄——对着沥青路面/天空/绿化这些
+# 常见背景对比度都高，看得清。不用ultralytics res.plot()自带的按类别自动配色，
+# 因为有些类别配色偏浅/偏白，在QA审核页面里看不清楚。
+DETECTION_BOX_COLOR = (0, 255, 255)
+DETECTION_BOX_THICKNESS = 3
+
+
+def _draw_detections(frame, res):
+    """手动画检测框(固定高对比度颜色)，代替res.plot()的自动配色。
+    跟_count_boxes一样区分obb(旋转框，4个顶点)和普通boxes(左上右下两点)。
+    """
+    import cv2  # 局部import，理由见模块顶部docstring(重依赖不强制全局装好)
+
+    annotated = frame.copy()
+    if res.obb is not None and len(res.obb):
+        points = res.obb.xyxyxyxy.cpu().numpy().astype(int)  # (N, 4, 2)
+        for pts in points:
+            cv2.polylines(
+                annotated, [pts.reshape(-1, 1, 2)], isClosed=True,
+                color=DETECTION_BOX_COLOR, thickness=DETECTION_BOX_THICKNESS,
+            )
+    elif res.boxes is not None and len(res.boxes):
+        boxes = res.boxes.xyxy.cpu().numpy().astype(int)
+        for x1, y1, x2, y2 in boxes:
+            cv2.rectangle(
+                annotated, (int(x1), int(y1)), (int(x2), int(y2)),
+                DETECTION_BOX_COLOR, DETECTION_BOX_THICKNESS,
+            )
+    return annotated
+
+
 def run_detection_batch(
     candidates: list[Video],
     *,
@@ -172,7 +203,7 @@ def run_detection_batch(
         raw_name = f"raw_f{fidx}.jpg"
         det_name = f"raw_f{fidx}_{model_name}_{model_version}.jpg"
         cv2.imwrite(str(test_dir / raw_name), frame)
-        cv2.imwrite(str(test_dir / det_name), res.plot(labels=False, conf=False))
+        cv2.imwrite(str(test_dir / det_name), _draw_detections(frame, res))
 
         sha_hex = sha256_bytes_to_hex(video.sha256)
         item = {
