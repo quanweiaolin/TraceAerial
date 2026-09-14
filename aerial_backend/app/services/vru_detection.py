@@ -121,15 +121,32 @@ def _count_boxes(res) -> int:
     return 0
 
 
-# 检测框颜色，BGR格式(cv2的通道顺序)，默认亮黄——对着沥青路面/天空/绿化这些
-# 常见背景对比度都高，看得清。不用ultralytics res.plot()自带的按类别自动配色，
-# 因为有些类别配色偏浅/偏白，在QA审核页面里看不清楚。
-DETECTION_BOX_COLOR = (0, 255, 255)
+# 按类别固定配色(BGR，cv2通道顺序)，不用ultralytics res.plot()自带的按类别
+# 自动配色——它是按调色板顺序轮着分配的，容易分到偏浅/偏白、看不清的颜色。
+# 这里手动挑8个互相区分度高、对着沥青路面/天空/绿化都清楚的颜色；跟模型
+# best_vru_universal.pt的类别对应(之前调试时打印过model.names确认过)。
+# 以后模型换了/加了新类别，在这个字典里加一条就行，不用改画框逻辑。
+CLASS_COLORS = {
+    "car": (0, 255, 255),               # 黄
+    "truck": (0, 140, 255),             # 橙
+    "bus": (0, 0, 255),                 # 红
+    "motorcycle": (255, 0, 255),        # 品红
+    "pedestrian": (0, 255, 0),          # 绿(VRU里最需要重点关注)
+    "bicycle": (255, 255, 0),           # 青
+    "tricycle": (255, 0, 0),            # 蓝
+    "engineering_vehicle": (204, 0, 102),  # 紫
+}
+DEFAULT_BOX_COLOR = (147, 20, 255)  # 没在上面字典里配到的类别用这个兜底(深粉)，不用白色
 DETECTION_BOX_THICKNESS = 3
 
 
+def _color_for_class(res, cls_id: int) -> tuple[int, int, int]:
+    class_name = res.names.get(cls_id, "") if hasattr(res, "names") else ""
+    return CLASS_COLORS.get(class_name, DEFAULT_BOX_COLOR)
+
+
 def _draw_detections(frame, res):
-    """手动画检测框(固定高对比度颜色)，代替res.plot()的自动配色。
+    """手动画检测框，按类别固定配色，代替res.plot()的自动配色。
     跟_count_boxes一样区分obb(旋转框，4个顶点)和普通boxes(左上右下两点)。
     """
     import cv2  # 局部import，理由见模块顶部docstring(重依赖不强制全局装好)
@@ -137,17 +154,19 @@ def _draw_detections(frame, res):
     annotated = frame.copy()
     if res.obb is not None and len(res.obb):
         points = res.obb.xyxyxyxy.cpu().numpy().astype(int)  # (N, 4, 2)
-        for pts in points:
+        classes = res.obb.cls.cpu().numpy().astype(int)
+        for pts, cls_id in zip(points, classes):
             cv2.polylines(
                 annotated, [pts.reshape(-1, 1, 2)], isClosed=True,
-                color=DETECTION_BOX_COLOR, thickness=DETECTION_BOX_THICKNESS,
+                color=_color_for_class(res, cls_id), thickness=DETECTION_BOX_THICKNESS,
             )
     elif res.boxes is not None and len(res.boxes):
         boxes = res.boxes.xyxy.cpu().numpy().astype(int)
-        for x1, y1, x2, y2 in boxes:
+        classes = res.boxes.cls.cpu().numpy().astype(int)
+        for (x1, y1, x2, y2), cls_id in zip(boxes, classes):
             cv2.rectangle(
                 annotated, (int(x1), int(y1)), (int(x2), int(y2)),
-                DETECTION_BOX_COLOR, DETECTION_BOX_THICKNESS,
+                _color_for_class(res, cls_id), DETECTION_BOX_THICKNESS,
             )
     return annotated
 
