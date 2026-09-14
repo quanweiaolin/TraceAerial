@@ -24,3 +24,6 @@ venv/
 checkpoints/
 
 tmp/
+
+# VRU检测QA本地测试用的临时输出目录(NAS权限没好之前的替代品)
+data/

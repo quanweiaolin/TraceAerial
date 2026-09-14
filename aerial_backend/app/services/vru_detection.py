@@ -27,19 +27,23 @@ from pathlib import Path
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.models import Notification, Video
 from app.services.hashing import sha256_bytes_to_hex
 
 SEED = 2025  # 跟学生原脚本一致，不要改——改了就没法复现已经跑过的那批结果
 
+# 目标根目录从配置读(AERIAL_VRU_PROCESSING_ROOT)，NAS权限没弄好之前可以先指向
+# 本地目录测试功能，权限好了改.env、重启服务即可切回NAS，不用改代码/重新部署。
+PROCESSING_ROOT = settings.vru_processing_root
+
 # Raw视频有两个来源根目录，历史遗留导致组织方式不一样(一个按数据集分、一个按人分)，
 # 但Processing_Data统一放一起，两条都换到同一个目标根。以后有新Raw来源在这加一条即可。
 RAW_TO_PROCESSING_ROOTS = {
-    "/mnt/nas/ADSafety/ADSafety/Aerial_Raw_Videos": "/mnt/nas/ADSafety/ADSafety/Aerial_Processing_Data",
-    "/mnt/Expansion/data": "/mnt/nas/ADSafety/ADSafety/Aerial_Processing_Data",
+    "/mnt/nas/ADSafety/ADSafety/Aerial_Raw_Videos": PROCESSING_ROOT,
+    "/mnt/Expansion/data": PROCESSING_ROOT,
 }
 
-PROCESSING_ROOT = "/mnt/nas/ADSafety/ADSafety/Aerial_Processing_Data"
 BATCH_MANIFEST_DIR = Path(PROCESSING_ROOT) / "_qa_batches"
 
 

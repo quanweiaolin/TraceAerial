@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     vru_model_path: str = ""
     vru_model_name: str = ""
     vru_model_version: str = ""
+    # 检测结果(Test/目录、批次清单)存放的根目录，正式环境是NAS的
+    # Aerial_Processing_Data；NAS权限没弄好之前可以先指向本地目录测试功能，
+    # 必须填绝对路径(比如项目根目录下的data/，填它的绝对路径，不要填相对路径
+    # 比如"../data"——图片是后续通过HTTP接口按路径读取的，相对路径依赖进程
+    # 当时的工作目录，容易出问题)，权限好了改回NAS绝对路径、重启服务即可
+    vru_processing_root: str = "/mnt/nas/ADSafety/ADSafety/Aerial_Processing_Data"
 
     # 数据库连接池
     db_pool_size: int = 10
