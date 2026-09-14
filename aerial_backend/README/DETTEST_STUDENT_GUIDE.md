@@ -1,6 +1,6 @@
 # VRU检测QA模块 —— 学生开发指南
 
-这份文档是你接手 VRU 检测可视化审核这部分工作的开发规范。目的是让你清楚
+这份文档是接手检测可视化QA这部分工作的开发规范。目的是搞清楚
 "哪些代码可以动、哪些不能动、数据从哪来、写到哪去"，避免动到跟你工作无关
 的模块，也避免弄乱现有的数据结构。
 
@@ -9,31 +9,32 @@
 
 ---
 
-## 1. 你的工作范围（可以改的文件）
+## 1. 工作范围（可以改的文件）
 
 只允许改这几个文件/目录，其他一律不要动：
 
-| 文件 | 说明 |
-|---|---|
-| `app/services/vru_detection.py` | 核心逻辑：选候选视频、抽帧、跑检测、画框、缩略图、模型对比。**你的主战场** |
-| `app/api/routers/qa_review.py` | 审核页面的后端接口 + 前端页面(纯HTML+原生JS，没有额外前端框架/构建工具) |
-| `app/Agent/` | 预留给"Agent影子判断"功能的目录，目前是空的，如果你的任务涉及这块再进去写 |
-| `app/config.py` | **只能加`vru_*`开头的新配置项**，不要碰其他已有的配置（数据库、飞书这些） |
-| `app/main.py` | **只能改跟VRU相关的部分**（`_run_qa_batch`/`scheduled_qa_batch`/`/qa/run-batch`这几处，代码里有清楚的函数边界），不要碰 `scheduled_scan`/`scheduled_notify`/`scheduled_daily_summary`/`scheduled_metadata_backfill`/`/scan/trigger` 这些，那些是扫盘/通知模块的，不归你管 |
-| `.env.example` | 只加 `AERIAL_VRU_*` 这几行，其他不要动 |
-| `pyproject.toml` | 只加VRU相关的新依赖（比如以后MLflow client库），加完看第5节怎么处理`uv.lock` |
+
+| 文件                            | 说明                                                                                                                                                                                                                                                                      |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `app/services/vru_detection.py` | 核心逻辑：选候选视频、抽帧、跑检测、画框、缩略图、模型对比。**主战场**                                                                                                                                                                                                    |
+| `app/api/routers/qa_review.py`  | 审核页面的后端接口 + 前端页面(纯HTML+原生JS，没有额外前端框架/构建工具)                                                                                                                                                                                                   |
+| `app/config.py`                 | **只能加`vru_*`开头的新配置项**，不要碰其他已有的配置（数据库、飞书这些）                                                                                                                                                                                                 |
+| `app/main.py`                   | **只能改跟VRU相关的部分**（`_run_qa_batch`/`scheduled_qa_batch`/`/qa/run-batch`这几处，代码里有清楚的函数边界），不要碰 `scheduled_scan`/`scheduled_notify`/`scheduled_daily_summary`/`scheduled_metadata_backfill`/`/scan/trigger` 这些，那些是扫盘/通知模块的，不归你管 |
+| `.env.example`                  | 只加`AERIAL_VRU_*` 这几行，其他不要动                                                                                                                                                                                                                                     |
+| `pyproject.toml`                | 只加VRU相关的新依赖（比如以后MLflow client库），加完看第5节怎么处理`uv.lock`                                                                                                                                                                                              |
 
 ## 2. 绝对不要碰的东西（及原因）
 
-| 东西 | 为什么不能碰 |
-|---|---|
-| `app/services/scanner.py` | 扫盘核心逻辑，全系统视频入库都靠它，改坏了整个数据链路断掉 |
-| `app/services/notifier.py`（除了你自己新增`event_type`模板那一行） | 飞书通知基础设施，别的功能也在用 |
-| `app/services/backfill.py` | 老视频元数据回填，跟你的任务无关 |
-| `app/models.py` | 数据库ORM定义，改列/加表要经过设计确认，不能自己加 |
-| `app/db.py` / `app/api/routers/videos.py` | 跟你的任务无关 |
-| 任何 `.sql` 文件（`aerial_video_db_schema.sql` 等） | 数据库schema变更必须走确认流程，不能自己改表结构 |
-| 生产数据库里的表 | 你的代码只允许**读** `videos` 表（`select_candidate_videos`已经封装好了，直接用，不要自己写新的SQL插入/更新`videos`表） |
+
+| 东西                                                               | 为什么不能碰                                                                                                            |
+| ------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| `app/services/scanner.py`                                          | 扫盘核心逻辑，全系统视频入库都靠它，改坏了整个数据链路断掉                                                              |
+| `app/services/notifier.py`（除了你自己新增`event_type`模板那一行） | 飞书通知基础设施，别的功能也在用                                                                                        |
+| `app/services/backfill.py`                                         | 老视频元数据回填，跟你的任务无关                                                                                        |
+| `app/models.py`                                                    | 数据库ORM定义，改列/加表要经过设计确认，不能自己加                                                                      |
+| `app/db.py` / `app/api/routers/videos.py`                          | 跟你的任务无关                                                                                                          |
+| 任何`.sql` 文件（`aerial_video_db_schema.sql` 等）                 | 数据库schema变更必须走确认流程，不能自己改表结构                                                                        |
+| 生产数据库里的表                                                   | 你的代码只允许**读** `videos` 表（`select_candidate_videos`已经封装好了，直接用，不要自己写新的SQL插入/更新`videos`表） |
 
 ## 3. 数据来源和写入规范
 
@@ -47,7 +48,7 @@
 这是航测原始素材，任何情况下你的代码都不能对这两个目录下的文件做写入、
 重命名、删除操作。读取（`cv2.VideoCapture`打开视频）没问题。
 
-### 3.2 处理结果（Processing_Data）—— 你的代码主要写这里
+### 3.2 处理结果（Processing_Data）—— Test文件夹下可以存下原始图片+检测图片
 
 ```
 /mnt/nas/ADSafety/ADSafety/Aerial_Processing_Data/...
@@ -128,9 +129,11 @@ checkpoints/*.pt   （.gitignore已排除，不进仓库）
   这几个包很重，模块顶部import的话，任何import这个文件的代码(比如只是想
   用`select_candidate_videos`查候选)都会被迫要求装好这些依赖。
 - **模型推理/图像处理这类阻塞操作，暴露给FastAPI的地方要丢进线程池**：
+
   ```python
   await asyncio.to_thread(某个同步阻塞函数, 参数...)
   ```
+
   不这么做会卡住整个服务的事件循环，其他所有请求/定时任务都会被拖慢。
   参考现有代码里 `run_detection_batch`/`detect_with_model_on_frame` 的调用方式。
 - **复用现成的函数，不要重复造轮子**：比如画框统一用 `_draw_detections`，
