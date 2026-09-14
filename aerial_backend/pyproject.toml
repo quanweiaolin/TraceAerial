@@ -9,20 +9,7 @@ dependencies = [
     "asyncpg>=0.31.0",
     "fastapi>=0.141.1",
     "httpx>=0.28.1",
-    "opencv-python-headless>=4.10.0",
     "pydantic-settings>=2.15.0",
     "sqlalchemy>=2.0.52",
-    "torch==2.14.0",
-    "torchvision==0.29.0",
-    "ultralytics==8.3.163",
     "uvicorn>=0.52.4",
 ]
-
-[tool.uv.sources]
-torch = { index = "pytorch-cu130" }
-torchvision = { index = "pytorch-cu130" }
-
-[[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
-explicit = true
