@@ -135,14 +135,14 @@ def _count_boxes(res) -> int:
 # best_vru_universal.pt的类别对应(之前调试时打印过model.names确认过)。
 # 以后模型换了/加了新类别，在这个字典里加一条就行，不用改画框逻辑。
 CLASS_COLORS = {
-    "car": (0, 255, 255),               # 黄
-    "truck": (0, 140, 255),             # 橙
-    "bus": (0, 0, 255),                 # 红
-    "motorcycle": (255, 0, 255),        # 品红
-    "pedestrian": (0, 255, 0),          # 绿(VRU里最需要重点关注)
-    "bicycle": (255, 255, 0),           # 青
-    "tricycle": (255, 0, 0),            # 蓝
-    "engineering_vehicle": (204, 0, 102),  # 紫
+    "pedestrian": (36, 32, 224),          # 红 — VRU最高优先级
+    "truck": (0, 149, 255),               # 橙
+    "engineering_vehicle": (18, 115, 128), # 橄榄/芥末
+    "tricycle": (133, 168, 0),            # 青绿
+    "bicycle": (224, 158, 0),             # 天蓝
+    "car": (214, 95, 70),                 # 靛蓝
+    "bus": (200, 64, 159),                # 紫
+    "motorcycle": (144, 32, 219),         # 玫红
 }
 DEFAULT_BOX_COLOR = (147, 20, 255)  # 没在上面字典里配到的类别用这个兜底(深粉)，不用白色
 DETECTION_BOX_THICKNESS = 3
