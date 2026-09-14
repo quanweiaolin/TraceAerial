@@ -28,3 +28,7 @@
 - Python + FastAPI + SQLAlchemy（异步）+ APScheduler（定时任务）
 - 飞书自定义机器人 webhook 做通知
 
+## 子模块文档
+
+- VRU检测QA可视化审核（学生开发指南）：[aerial_backend/VRU_STUDENT_GUIDE.md](aerial_backend/VRU_STUDENT_GUIDE.md)
+
