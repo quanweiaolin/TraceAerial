@@ -19,8 +19,10 @@ import，不强制要求这几个重依赖已经装好，只有真正跑检测�
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import random
+import tempfile
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -45,6 +47,12 @@ RAW_TO_PROCESSING_ROOTS = {
 }
 
 BATCH_MANIFEST_DIR = Path(PROCESSING_ROOT) / "_qa_batches"
+
+# 审核页面看的缩略图缓存目录。原图(检测/推理用)保持原始分辨率不动，
+# 4K截帧直接扔给浏览器会很大(2MB+/张)，在tailscale这种远程弱网环境下
+# 容易加载失败/超时。缩略图第一次被请求时才现算，存/tmp，下次直接复用。
+THUMBNAIL_DIR = Path(tempfile.gettempdir()) / "aerial_qa_thumbnails"
+THUMBNAIL_MAX_DIM = 1280
 
 
 def compute_processing_dir(storage_path: str) -> Path:
@@ -169,6 +177,38 @@ def _draw_detections(frame, res):
                 _color_for_class(res, cls_id), DETECTION_BOX_THICKNESS,
             )
     return annotated
+
+
+def _thumbnail_cache_path(image_path: str, max_dim: int) -> Path:
+    # 缓存key用原图路径(+尺寸)算hash，不用原图文件名——避免不同目录下同名
+    # 文件(比如都叫raw_f0.jpg)在/tmp这个平铺目录里互相覆盖。
+    key = hashlib.sha256(f"{image_path}|{max_dim}".encode("utf-8")).hexdigest()
+    return THUMBNAIL_DIR / f"{key}.jpg"
+
+
+def get_or_create_thumbnail(image_path: str, max_dim: int = THUMBNAIL_MAX_DIM) -> Path:
+    """审核页面给浏览器看的缩略图：第一次请求某张图时才现算+存进/tmp缓存，
+    以后同一张图直接复用，不重复读取/缩放。原图(检测/推理用，包括"对比模型"
+    功能复用的raw_f{idx}.jpg)保持原始分辨率完全不动，不受这个影响。
+    """
+    cache_path = _thumbnail_cache_path(image_path, max_dim)
+    if cache_path.is_file():
+        return cache_path
+
+    import cv2
+
+    img = cv2.imread(image_path)
+    if img is None:
+        raise FileNotFoundError(f"读取不了原图，生成不了缩略图: {image_path}")
+
+    h, w = img.shape[:2]
+    scale = max_dim / max(h, w)
+    if scale < 1:
+        img = cv2.resize(img, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
+
+    THUMBNAIL_DIR.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(cache_path), img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return cache_path
 
 
 def list_available_models() -> list[str]:

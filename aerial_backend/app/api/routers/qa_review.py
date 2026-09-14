@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from app.services.vru_detection import (
     PROCESSING_ROOT,
     detect_with_model_on_frame,
+    get_or_create_thumbnail,
     list_available_models,
     list_batch_dates,
     read_batch_manifest,
@@ -27,6 +28,19 @@ from app.services.vru_detection import (
 )
 
 router = APIRouter(prefix="/qa", tags=["qa_review"])
+
+
+def _resolve_allowed_path(path: str) -> Path:
+    """校验路径必须在Aerial_Processing_Data(或本地测试替代目录)根下，
+    防止/qa/image、/qa/thumbnail被当成任意文件读取接口。"""
+    p = Path(path)
+    try:
+        p.relative_to(PROCESSING_ROOT)
+    except ValueError:
+        raise HTTPException(403, "path not under allowed root")
+    if not p.is_file():
+        raise HTTPException(404, "file not found")
+    return p
 
 
 @router.get("/batches")
@@ -53,16 +67,19 @@ async def get_batch_items(date_str: str):
 
 @router.get("/image")
 async def get_image(path: str):
-    """按绝对路径读图片文件返回，仅限Aerial_Processing_Data这个根目录下的文件，
-    防止被拿来当成任意文件读取接口。"""
-    p = Path(path)
-    try:
-        p.relative_to(PROCESSING_ROOT)
-    except ValueError:
-        raise HTTPException(403, "path not under allowed root")
-    if not p.is_file():
-        raise HTTPException(404, "file not found")
+    """按绝对路径读原图返回(完整分辨率)。仅限Aerial_Processing_Data根目录下的文件。"""
+    p = _resolve_allowed_path(path)
     return FileResponse(p)
+
+
+@router.get("/thumbnail")
+async def get_thumbnail(path: str):
+    """跟/qa/image一样校验路径，但返回缩小过的缓存版本，给页面<img>用——
+    原图4K截帧几MB一张，直接传给浏览器在弱网(比如tailscale远程访问)下容易
+    加载超时/失败。第一次请求某张图时现算缩略图存/tmp，之后直接复用。"""
+    p = _resolve_allowed_path(path)
+    thumb_path = await asyncio.to_thread(get_or_create_thumbnail, str(p))
+    return FileResponse(thumb_path)
 
 
 class ReviewItemIn(BaseModel):
@@ -223,7 +240,7 @@ function getDetectionDisplay(item, idx) {
   // 猜一个路径去试(试失败会走img的onerror占位逻辑)。
   if (!currentModel) {
     return {
-      url: '/qa/image?path=' + encodeURIComponent(item.detection_image),
+      url: '/qa/thumbnail?path=' + encodeURIComponent(item.detection_image),
       n_boxes: item.n_boxes,
       modelLabel: `${item.model_name}/${item.model_version}`,
     };
@@ -231,14 +248,14 @@ function getDetectionDisplay(item, idx) {
   const cached = item.compareResults[currentModel];
   if (cached) {
     return {
-      url: '/qa/image?path=' + encodeURIComponent(cached.detection_image) + '&t=' + Date.now(),
+      url: '/qa/thumbnail?path=' + encodeURIComponent(cached.detection_image) + '&t=' + Date.now(),
       n_boxes: cached.n_boxes,
       modelLabel: `${modelStemOf(currentModel)}/manual`,
     };
   }
   const guessPath = `${item.test_dir}/raw_f${item.frame_idx}_${modelStemOf(currentModel)}_manual.jpg`;
   return {
-    url: '/qa/image?path=' + encodeURIComponent(guessPath),
+    url: '/qa/thumbnail?path=' + encodeURIComponent(guessPath),
     n_boxes: '-',
     modelLabel: `${modelStemOf(currentModel)}/manual`,
   };
