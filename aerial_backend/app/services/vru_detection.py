@@ -171,6 +171,73 @@ def _draw_detections(frame, res):
     return annotated
 
 
+def list_available_models() -> list[str]:
+    """列出checkpoints目录(AERIAL_VRU_MODEL_PATH的上一级目录)下所有.pt文件名，
+    给前端下拉框选"用哪个模型看这一帧的检测结果"用于对比。暂时直接用文件名
+    当模型标识——等MLflow模型版本管理上线后，这里会换成真正的注册版本号，
+    不用再靠文件名分辨"是哪个模型"。
+    """
+    checkpoints_dir = Path(settings.vru_model_path).parent
+    if not checkpoints_dir.is_dir():
+        return []
+    return sorted(p.name for p in checkpoints_dir.glob("*.pt"))
+
+
+_MODEL_CACHE: dict = {}  # model_path(str) -> 已加载的YOLO实例，避免同一个模型反复加载
+
+
+def _get_cached_model(model_path: str):
+    from ultralytics import YOLO
+
+    if model_path not in _MODEL_CACHE:
+        _MODEL_CACHE[model_path] = YOLO(model_path)
+    return _MODEL_CACHE[model_path]
+
+
+def detect_with_model_on_frame(
+    raw_image_path: str,
+    test_dir: str,
+    frame_idx: int,
+    model_filename: str,
+    conf: float = 0.4,
+) -> dict:
+    """用指定模型(checkpoints目录下某个.pt文件)对一帧已经抽好的图重新跑检测，
+    给"对比不同模型效果"用。直接读已经存在的raw_f{idx}.jpg，不重新抽帧——
+    保证跟批次默认模型看的是完全同一帧，才有对比意义。
+
+    model_version暂时固定写"manual"，跟run_detection_batch产出的批次默认结果
+    (走.env里配置的AERIAL_VRU_MODEL_VERSION)区分开；等MLflow模型版本管理
+    上线后再换成真正的版本号。
+    """
+    import cv2
+
+    checkpoints_dir = Path(settings.vru_model_path).parent
+    model_path = checkpoints_dir / model_filename
+    if not model_path.is_file():
+        raise FileNotFoundError(f"模型文件不存在: {model_path}")
+
+    frame = cv2.imread(raw_image_path)
+    if frame is None:
+        raise ValueError(f"读取不了这一帧(文件可能不存在/已损坏): {raw_image_path}")
+
+    model = _get_cached_model(str(model_path))
+    res = model(frame, conf=conf, verbose=False)[0]
+    n_boxes = _count_boxes(res)
+
+    model_name = model_path.stem
+    model_version = "manual"
+    det_name = f"raw_f{frame_idx}_{model_name}_{model_version}.jpg"
+    det_path = Path(test_dir) / det_name
+    cv2.imwrite(str(det_path), _draw_detections(frame, res))
+
+    return {
+        "detection_image": str(det_path),
+        "n_boxes": n_boxes,
+        "model_name": model_name,
+        "model_version": model_version,
+    }
+
+
 def run_detection_batch(
     candidates: list[Video],
     *,
