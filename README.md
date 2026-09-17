@@ -33,11 +33,13 @@
 
 表建在 `aerial` 这个schema下（不是默认的 `public`），下面几种方式都要注意这点。
 
+学生/外部人员统一用只读账户 `reader`（密码 `reader`），只能查询、不能改数据，
+下面的例子都用这个账户。不要用管理员账户连库。
 
 ### 1. shell（psql）
 
 ```bash
-psql "postgresql://ad4che:ad4che@localhost:5432/aerial_db"
+psql "postgresql://reader:reader@localhost:5432/aerial_db"
 ```
 
 ```sql
@@ -50,7 +52,7 @@ SELECT * FROM videos LIMIT 5;
 一次性查询（不进交互模式）：
 
 ```bash
-psql "postgresql://ad4che:ad4che@localhost:5432/aerial_db" \
+psql "postgresql://reader:reader@localhost:5432/aerial_db" \
   -c "SET search_path TO aerial, public;" \
   -c "SELECT storage_path, created_at FROM videos ORDER BY created_at DESC LIMIT 5;"
 ```
@@ -63,7 +65,7 @@ import asyncpg
 
 async def main():
     conn = await asyncpg.connect(
-        host="localhost", port=5432, user="ad4che", password="ad4che", database="aerial_db",
+        host="localhost", port=5432, user="reader", password="reader", database="aerial_db",
         server_settings={"search_path": "aerial,public"},
     )
     rows = await conn.fetch("SELECT storage_path, created_at FROM videos LIMIT 5;")
@@ -93,7 +95,7 @@ SELECT storage_path FROM videos WHERE collect_lon IS NULL OR collect_lat IS NULL
 连接这个库时同样要注意：默认schema是 `public`，Metabase里选数据库/表的时候要选
 `aerial` 这个schema下的表，或者在连接的高级设置里把 `public` 改成 `aerial`。
 
-具体访问地址/账号找项目负责人要，这里不写死（不同环境部署的地址不一样）。
+具体访问地址：服务器IP:3000, 账号密码找quanwei/ziyu要。
 
 ### `videos` 表字段说明
 
