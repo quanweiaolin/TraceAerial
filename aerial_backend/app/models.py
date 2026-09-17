@@ -176,3 +176,22 @@ class DataSubmission(Base):
     validation_status: Mapped[str] = mapped_column(String(16))
     validation_errors: Mapped[dict | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AliyunSyncEvent(Base):
+    """阿里云PDS自动下载流程的事件记录，只在"真的有事发生"时才INSERT
+    (文件夹判定上传完成/检测到异常)，日常巡检发现无变化不写这张表。
+    见 add_aliyun_sync_events.sql 顶部注释。"""
+
+    __tablename__ = "aliyun_sync_events"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(32))
+    issue_type: Mapped[str | None] = mapped_column(String(32))
+    cloud_folder_id: Mapped[str] = mapped_column(Text)
+    cloud_folder_path: Mapped[str | None] = mapped_column(Text)
+    videos: Mapped[list] = mapped_column(JSONB, default=list)
+    scan_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    download_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    download_finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
