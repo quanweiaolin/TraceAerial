@@ -16,11 +16,12 @@
 真的执行UPDATE。
 
 用法：
-    python reconcile_video_paths.py \
+    python aerial_backend/scripts/reconcile_video_paths.py \
         /mnt/Expansion/Aerial_Raw_Videos \
         /mnt/nas/ADSafety/ADSafety/Aerial_Raw_Videos \
         --database-url postgresql://user:pass@localhost:5432/aerial_db
     # 确认dry-run输出没问题后加 --apply 真的执行
+    # 输出里会按每个root单独列检查文件数，方便确认所有传入的root都真的扫到了
 """
 from __future__ import annotations
 
@@ -50,7 +51,7 @@ def iter_video_files(roots: list[Path]):
                 continue
             if path.name.startswith("._") or ".compress_tmp." in path.name:
                 continue
-            yield path
+            yield root, path
 
 
 async def resolve_by_hash(conn, path: Path) -> bytes | None:
@@ -68,6 +69,7 @@ async def main(roots: list[str], database_url: str, apply: bool) -> None:
     conn = await asyncpg.connect(database_url, server_settings={"search_path": "aerial,public"})
     try:
         checked = fast_matched = ambiguous = unmatched = updated = 0
+        per_root_checked: dict[str, int] = {r: 0 for r in roots}
         batch: list[Path] = []
 
         async def flush(batch: list[Path]):
@@ -114,16 +116,21 @@ async def main(roots: list[str], database_url: str, apply: bool) -> None:
                     )
                     updated += 1
 
-        for path in iter_video_files(root_paths):
+        for root, path in iter_video_files(root_paths):
             checked += 1
+            per_root_checked[str(root)] += 1
             batch.append(path)
             if len(batch) >= BATCH_SIZE:
                 await flush(batch)
                 batch = []
         await flush(batch)
 
+        print("\n各根目录检查文件数:")
+        for root, count in per_root_checked.items():
+            print(f"  {root}: {count}")
+
         print(
-            f"\n磁盘上检查文件数: {checked}  快速匹配(名字+大小): {fast_matched}  "
+            f"\n磁盘上检查文件数合计: {checked}  快速匹配(名字+大小): {fast_matched}  "
             f"歧义走哈希消歧: {ambiguous}  DB里找不到对应记录: {unmatched}  "
             f"{'已更新' if apply else '将更新(dry-run)'}: {updated if apply else '见上面列表'}"
         )
