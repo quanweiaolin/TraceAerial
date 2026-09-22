@@ -61,6 +61,10 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
             # AppleDouble元数据"影子"文件，体积很小(常见4096字节)，跟真实
             # 视频内容无关，不是"正在上传中"——直接跳过，不算files_found
             continue
+        if ".compress_tmp." in path.name:
+            # 视频瘦身(重新编码)转码过程中的临时输出文件，转码完成后会被
+            # 重命名/清理掉，扫盘时如果恰好撞见半成品不应该当成正式视频记录
+            continue
         files_found += 1
         # print(f"scanning: {path}")
         file_size = path.stat().st_size
