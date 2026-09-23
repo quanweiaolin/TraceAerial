@@ -7,12 +7,12 @@
 """
 import asyncio
 
-from app.db import AsyncSessionLocal
+from app.db import SessionContext
 from app.services.aliyun_sync import run_aliyun_scan
 
 
 async def main() -> None:
-    async with AsyncSessionLocal() as session:
+    async with SessionContext() as session:
         await run_aliyun_scan(session)
     print("扫描完成，结果见 aliyun_folder_scans / aliyun_sync_events 表")
 

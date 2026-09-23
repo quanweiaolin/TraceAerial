@@ -181,18 +181,10 @@ async def _last_known_files(session: AsyncSession, cloud_folder_id: str) -> list
     return row.files if row is not None else None
 
 
-async def _trigger_download(
-    session: AsyncSession,
-    cli: PdsCli,
-    folder: dict[str, Any],
-    file_entries: list[dict[str, Any]],
-    scan_completed_at: datetime,
-) -> None:
+async def _download_folder_files(folder: dict[str, Any], cli: PdsCli) -> list[dict[str, Any]]:
+    """下载文件夹里全部当前文件；已经下载过的会在download_item内部按哈希跳过，
+    所以对"完成后又有新增"这种情况重新调一次也是安全的、只会真正下载新文件。"""
     folder_path = folder["cloud_folder_path"]
-    if not await ensure_enough_space(settings.aliyun_download_dir):
-        return  # 磁盘不够，飞书已经发过了，等下次心跳再试
-
-    download_started_at = datetime.now(timezone.utc)
     downloaded: list[dict[str, Any]] = []
     for raw_item in folder["raw_files"]:
         try:
@@ -206,7 +198,33 @@ async def _trigger_download(
             "content_hash": raw_item.get("content_hash"),
             "content_hash_algo": raw_item.get("content_hash_name"),
             "local_path": result.get("local_path"),
+            "download_status": result.get("status"),  # downloaded/skipped/conflicted
         })
+    return downloaded
+
+
+def _download_summary_line(downloaded: list[dict[str, Any]]) -> str:
+    """按download_item实际返回的status分类计数，跟"总共尝试了几个文件"分开说，
+    避免"已下载N个"这种表述在N个其实都是已存在跳过时显得有误导。"""
+    new_count = sum(1 for d in downloaded if d.get("download_status") == "downloaded")
+    skipped_count = sum(1 for d in downloaded if d.get("download_status") == "skipped")
+    conflicted_count = sum(1 for d in downloaded if d.get("download_status") == "conflicted")
+    return f"新下载 {new_count} 个，已存在跳过 {skipped_count} 个，冲突 {conflicted_count} 个，共 {len(downloaded)} 个文件"
+
+
+async def _trigger_download(
+    session: AsyncSession,
+    cli: PdsCli,
+    folder: dict[str, Any],
+    file_entries: list[dict[str, Any]],
+    scan_completed_at: datetime,
+) -> None:
+    folder_path = folder["cloud_folder_path"]
+    if not await ensure_enough_space(settings.aliyun_download_dir):
+        return  # 磁盘不够，飞书已经发过了，等下次心跳再试
+
+    download_started_at = datetime.now(timezone.utc)
+    downloaded = await _download_folder_files(folder, cli)
     download_finished_at = datetime.now(timezone.utc)
 
     session.add(AliyunSyncEvent(
@@ -220,22 +238,33 @@ async def _trigger_download(
         notified_at=datetime.now(timezone.utc),
     ))
     await send_feishu_message(
-        f"✅ 阿里云文件夹上传完成，已下载 {len(downloaded)} 个文件：{folder_path}"
+        f"✅ 阿里云文件夹上传完成：{folder_path}\n{_download_summary_line(downloaded)}"
     )
 
 
-async def _handle_reupload(session: AsyncSession, folder: dict[str, Any], file_entries: list[dict[str, Any]]) -> None:
+async def _handle_reupload(
+    session: AsyncSession, cli: PdsCli, folder: dict[str, Any], file_entries: list[dict[str, Any]]
+) -> None:
     folder_path = folder["cloud_folder_path"]
+    if not await ensure_enough_space(settings.aliyun_download_dir):
+        return  # 磁盘不够，飞书已经发过了，等下次心跳再试
+
+    download_started_at = datetime.now(timezone.utc)
+    downloaded = await _download_folder_files(folder, cli)
+    download_finished_at = datetime.now(timezone.utc)
+
     session.add(AliyunSyncEvent(
         event_type="issue",
         issue_type="reupload_after_complete",
         cloud_folder_id=folder["cloud_folder_id"],
         cloud_folder_path=folder_path,
-        videos=[],
+        videos=downloaded,
+        download_started_at=download_started_at,
+        download_finished_at=download_finished_at,
         notified_at=datetime.now(timezone.utc),
     ))
     await send_feishu_message(
-        f"⚠️ 已判定完成的文件夹又有新上传，继续下载：{folder_path}"
+        f"⚠️ 已判定完成的文件夹又有新上传：{folder_path}\n{_download_summary_line(downloaded)}"
     )
 
 
@@ -303,7 +332,7 @@ async def _process_folder(session: AsyncSession, cli: PdsCli, folder: dict[str, 
     if not changed:
         return
     if file_count > previous.file_count or size_bytes > previous.size_bytes:
-        await _handle_reupload(session, folder, file_entries)
+        await _handle_reupload(session, cli, folder, file_entries)
     else:
         await _handle_possible_deletion(session, folder, file_entries)
 
