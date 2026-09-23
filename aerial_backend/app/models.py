@@ -11,8 +11,8 @@ import enum
 from datetime import datetime
 
 from sqlalchemy import (
-    BigInteger, DateTime, ForeignKey, LargeBinary, SmallInteger, String, Text,
-    UniqueConstraint, func,
+    BigInteger, Boolean, DateTime, ForeignKey, Integer, LargeBinary, SmallInteger,
+    String, Text, UniqueConstraint, func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -195,3 +195,19 @@ class AliyunSyncEvent(Base):
     download_finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AliyunFolderScan(Base):
+    """阿里云PDS文件夹心跳历史，每次定时扫描每个被监控文件夹记一行，永久保留。
+    只在changed=True时填充files完整文件列表，见 add_aliyun_folder_scans.sql。"""
+
+    __tablename__ = "aliyun_folder_scans"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    drive_id: Mapped[str] = mapped_column(Text)
+    cloud_folder_id: Mapped[str] = mapped_column(Text)
+    cloud_folder_path: Mapped[str | None] = mapped_column(Text)
+    scanned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    file_count: Mapped[int] = mapped_column(Integer)
+    changed: Mapped[bool] = mapped_column(Boolean, default=False)
+    files: Mapped[list | None] = mapped_column(JSONB)

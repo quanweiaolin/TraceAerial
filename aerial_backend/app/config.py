@@ -28,5 +28,18 @@ class Settings(BaseSettings):
     db_pool_size: int = 10
     db_max_overflow: int = 10
 
+    # 阿里云PDS自动下载：官方aliyun CLI二进制路径，留空则默认用
+    # extern/pds-drive-sync/.tools/aliyun(pds-sync setup装的那个)
+    aliyun_cli_binary: str = ""
+    # PDS哪几个空间要扫，跟pds-drive-sync自己的默认一致
+    aliyun_spaces: list[str] = ["personal", "team", "enterprise"]
+    # 下载暂存目录(SSD，不是最终NAS落盘位置，也不在scan_roots扫盘范围内)
+    aliyun_download_dir: str = "data"
+    # 下载前检查这块SSD剩余空间(GiB)，不够就飞书提示、不下载
+    aliyun_min_free_gb: int = 200
+    # 连续多少次心跳大小/文件数都没变，才判定"上传完成"(6小时一次心跳，
+    # 8次=2天)
+    aliyun_stability_scans_required: int = 8
+
 
 settings = Settings()
