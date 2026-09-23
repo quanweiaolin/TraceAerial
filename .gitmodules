@@ -1,0 +1,3 @@
+[submodule "extern/pds-drive-sync"]
+	path = extern/pds-drive-sync
+	url = https://github.com/zzi4/pds-drive-sync.git
