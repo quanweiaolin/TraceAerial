@@ -8,8 +8,7 @@ DATABASE_URL="${1:-postgresql://reader:reader@localhost:5432/aerial_db}"
 SAMPLE_SIZE="${2:-100}"
 
 paths=$(psql "$DATABASE_URL" -t -A \
-  -c "SET search_path TO aerial, public;" \
-  -c "SELECT storage_path FROM videos WHERE deleted_at IS NULL ORDER BY random() LIMIT ${SAMPLE_SIZE};")
+  -c "SELECT storage_path FROM aerial.videos WHERE deleted_at IS NULL ORDER BY random() LIMIT ${SAMPLE_SIZE};")
 
 checked=0
 missing=0
