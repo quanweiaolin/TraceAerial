@@ -23,11 +23,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import secrets
 import shutil
 import sys
 from collections import deque
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from sqlalchemy import select
@@ -46,8 +48,9 @@ from pds_sync.core import (  # noqa: E402  (必须在sys.path插入之后才能i
     ITEM_PROJECTION,
     PdsCli,
     PdsError,
+    _conflict_path,
+    _file_matches,
     _paginate,
-    download_item,
     list_drives,
 )
 
@@ -192,9 +195,66 @@ async def _last_known_files(session: AsyncSession, cloud_folder_id: str) -> list
     return row.files if row is not None else None
 
 
+def _download_one_file(cli: PdsCli, cloud_path: str, raw_item: dict[str, Any], download_root: Path) -> dict[str, Any]:
+    """同步阻塞调用(内部是subprocess)，调用方要丢进线程池。
+
+    不用pds_sync.core.download_item：它会把本地路径套一层"space_type-drive_id"
+    目录，但PDS的list-file返回里根本没有space_type这个字段(只有list-drive
+    才有)，导致这层目录永远是没有实际意义的"unknown-<drive_id>"(见
+    2026-09-25的讨论)。这里直接用BFS遍历时已经知道的cloud_path，本地路径
+    就是download_root+cloud_path，干净且不用再多调一次resolve-path API。
+    哈希跳过(_file_matches)/冲突改名(_conflict_path)逻辑跟download_item一致，
+    直接复用pds_sync.core里现成的纯函数。"""
+    drive_id = str(raw_item.get("drive_id") or "")
+    file_id = str(raw_item.get("file_id") or "")
+    root = Path(download_root).resolve()
+    relative = PurePosixPath(cloud_path).relative_to("/")
+    target = (root / relative).resolve()
+    if not target.is_relative_to(root):
+        raise ValueError(f"云端路径逃出了下载目录: {cloud_path}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    status = "downloaded"
+    if target.exists():
+        if target.is_file() and _file_matches(raw_item, target):
+            return {"file_id": file_id, "cloud_path": cloud_path, "local_path": str(target), "status": "skipped"}
+        target = _conflict_path(target, file_id)
+        status = "conflicted"
+
+    temporary = target.with_name(f".{target.name}.{secrets.token_hex(6)}.part")
+    try:
+        result = cli.pds([
+            "download-to-local",
+            "--drive-id", drive_id,
+            "--file-id", file_id,
+            "--save-to", str(temporary),
+        ])
+        if not temporary.is_file():
+            raise PdsError(f"download did not create a local file for {file_id}")
+        local_size = temporary.stat().st_size
+        expected_sizes = {
+            int(value)
+            for value in (raw_item.get("size"), result.get("size") if isinstance(result, dict) else None)
+            if isinstance(value, int) and value >= 0
+        }
+        if expected_sizes and (len(expected_sizes) != 1 or local_size not in expected_sizes):
+            raise PdsError(f"download size verification failed for {file_id}")
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        return {
+            "file_id": file_id, "cloud_path": cloud_path, "local_path": str(target),
+            "size": local_size, "status": status,
+        }
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 async def _download_folder_files(folder: dict[str, Any], cli: PdsCli) -> list[dict[str, Any]]:
-    """下载文件夹里全部当前文件；已经下载过的会在download_item内部按哈希跳过，
-    所以对"完成后又有新增"这种情况重新调一次也是安全的、只会真正下载新文件。
+    """下载文件夹里全部当前文件；已经下载过的会按哈希跳过(_download_one_file
+    内部逻辑)，所以对"完成后又有新增"这种情况重新调一次也是安全的、只会
+    真正下载新文件。
 
     注意：不直接用传进来的cli(那个是给list-file这类快调用用的，超时只有
     60s)——航测视频单个文件常常几GB，60s传不完就会被判超时(见2026-09-25
@@ -204,15 +264,16 @@ async def _download_folder_files(folder: dict[str, Any], cli: PdsCli) -> list[di
     download_cli = _build_download_cli()
     downloaded: list[dict[str, Any]] = []
     for raw_item in folder["raw_files"]:
+        cloud_path = f"{folder_path.rstrip('/')}/{raw_item.get('name')}"
         try:
             result = await asyncio.to_thread(
-                download_item, download_cli, raw_item, Path(settings.aliyun_download_dir)
+                _download_one_file, download_cli, cloud_path, raw_item, Path(settings.aliyun_download_dir)
             )
         except (PdsError, OSError, ValueError) as exc:
             await send_feishu_message(f"⚠️ 阿里云下载失败：{folder_path} 里的 {raw_item.get('name')}：{exc}")
             downloaded.append({
                 "cloud_file_id": raw_item.get("file_id"),
-                "cloud_path": None,
+                "cloud_path": cloud_path,
                 "content_hash": raw_item.get("content_hash"),
                 "content_hash_algo": raw_item.get("content_hash_name"),
                 "local_path": None,
