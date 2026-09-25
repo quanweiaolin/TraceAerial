@@ -66,7 +66,7 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
             # 重命名/清理掉，扫盘时如果恰好撞见半成品不应该当成正式视频记录
             continue
         files_found += 1
-        print(f"[scan] scanning: {path}", flush=True)
+        # print(f"[scan] scanning: {path}", flush=True)
         file_size = path.stat().st_size
 
         # 缓存命中：之前扫过同路径+同大小的文件、且hash算完了，直接复用sha256，
