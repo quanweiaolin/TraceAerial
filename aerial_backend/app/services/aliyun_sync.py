@@ -60,7 +60,17 @@ def _cli_binary_path() -> Path:
 
 
 def _build_cli() -> PdsCli:
+    """给list-file/list-drive这类快调用用，超时给默认的60s，网络/API有问题
+    能尽快失败，不用等太久。"""
     return PdsCli(_cli_binary_path())
+
+
+def _build_download_cli() -> PdsCli:
+    """专门给download-to-local用，航测视频单个文件常常几GB，60s的默认超时
+    根本不够，下载还没传完就被判定超时(见2026-09-25的飞书报警：
+    'Aliyun CLI timed out after 60s')。用settings.aliyun_download_timeout_seconds
+    单独给一个大得多的超时，不影响其他快调用的"快速失败"特性。"""
+    return PdsCli(_cli_binary_path(), timeout_seconds=settings.aliyun_download_timeout_seconds)
 
 
 def free_space_gb(path: str | Path) -> float:
@@ -183,14 +193,31 @@ async def _last_known_files(session: AsyncSession, cloud_folder_id: str) -> list
 
 async def _download_folder_files(folder: dict[str, Any], cli: PdsCli) -> list[dict[str, Any]]:
     """下载文件夹里全部当前文件；已经下载过的会在download_item内部按哈希跳过，
-    所以对"完成后又有新增"这种情况重新调一次也是安全的、只会真正下载新文件。"""
+    所以对"完成后又有新增"这种情况重新调一次也是安全的、只会真正下载新文件。
+
+    注意：不直接用传进来的cli(那个是给list-file这类快调用用的，超时只有
+    60s)——航测视频单个文件常常几GB，60s传不完就会被判超时(见2026-09-25
+    实际报警：'Aliyun CLI timed out after 60s')，这里单独用
+    _build_download_cli()构造一个大超时的实例。"""
     folder_path = folder["cloud_folder_path"]
+    download_cli = _build_download_cli()
     downloaded: list[dict[str, Any]] = []
     for raw_item in folder["raw_files"]:
         try:
-            result = await asyncio.to_thread(download_item, cli, raw_item, Path(settings.aliyun_download_dir))
+            result = await asyncio.to_thread(
+                download_item, download_cli, raw_item, Path(settings.aliyun_download_dir)
+            )
         except (PdsError, OSError, ValueError) as exc:
             await send_feishu_message(f"⚠️ 阿里云下载失败：{folder_path} 里的 {raw_item.get('name')}：{exc}")
+            downloaded.append({
+                "cloud_file_id": raw_item.get("file_id"),
+                "cloud_path": None,
+                "content_hash": raw_item.get("content_hash"),
+                "content_hash_algo": raw_item.get("content_hash_name"),
+                "local_path": None,
+                "download_status": "failed",
+                "error": str(exc),
+            })
             continue
         downloaded.append({
             "cloud_file_id": result.get("file_id"),
@@ -209,7 +236,11 @@ def _download_summary_line(downloaded: list[dict[str, Any]]) -> str:
     new_count = sum(1 for d in downloaded if d.get("download_status") == "downloaded")
     skipped_count = sum(1 for d in downloaded if d.get("download_status") == "skipped")
     conflicted_count = sum(1 for d in downloaded if d.get("download_status") == "conflicted")
-    return f"新下载 {new_count} 个，已存在跳过 {skipped_count} 个，冲突 {conflicted_count} 个，共 {len(downloaded)} 个文件"
+    failed_count = sum(1 for d in downloaded if d.get("download_status") == "failed")
+    return (
+        f"新下载 {new_count} 个，已存在跳过 {skipped_count} 个，冲突 {conflicted_count} 个，"
+        f"失败 {failed_count} 个，共 {len(downloaded)} 个文件"
+    )
 
 
 async def _trigger_download(
@@ -226,6 +257,7 @@ async def _trigger_download(
     download_started_at = datetime.now(timezone.utc)
     downloaded = await _download_folder_files(folder, cli)
     download_finished_at = datetime.now(timezone.utc)
+    all_succeeded = all(d.get("download_status") != "failed" for d in downloaded)
 
     session.add(AliyunSyncEvent(
         event_type="folder_ready",
@@ -234,12 +266,22 @@ async def _trigger_download(
         videos=downloaded,
         scan_completed_at=scan_completed_at,
         download_started_at=download_started_at,
-        download_finished_at=download_finished_at,
+        # 只有全部文件都成功才标记download_finished_at，
+        # 这样_latest_ready_event判断"已完成"才会准确——只要有文件失败，
+        # 这里就留空，下次心跳(云端内容没变、还是"稳定"状态)会自动重新
+        # 触发一次完整的下载尝试，已成功的文件靠download_item的哈希跳过，
+        # 只会真正重试失败的那个
+        download_finished_at=download_finished_at if all_succeeded else None,
         notified_at=datetime.now(timezone.utc),
     ))
-    await send_feishu_message(
-        f"✅ 阿里云文件夹上传完成：{folder_path}\n{_download_summary_line(downloaded)}"
-    )
+    if all_succeeded:
+        await send_feishu_message(
+            f"✅ 阿里云文件夹上传完成：{folder_path}\n{_download_summary_line(downloaded)}"
+        )
+    else:
+        await send_feishu_message(
+            f"⚠️ 阿里云文件夹下载未全部成功，下次心跳会自动重试：{folder_path}\n{_download_summary_line(downloaded)}"
+        )
 
 
 async def _handle_reupload(
@@ -338,11 +380,17 @@ async def _process_folder(session: AsyncSession, cli: PdsCli, folder: dict[str, 
 
 
 async def run_aliyun_scan(session: AsyncSession) -> None:
-    """完整跑一次：遍历全部drive的全部叶子文件夹，逐个记心跳、判断是否要下载/报警。"""
+    """完整跑一次：遍历全部drive的全部叶子文件夹，逐个记心跳、判断是否要下载/报警。
+
+    每个文件夹处理完就commit一次，不是等全部文件夹跑完才一次性commit——
+    单个文件夹的下载可能要跑很久(大文件)，中途被Ctrl-C/进程被杀的话，
+    只在最后commit会导致这一整轮扫描、包括之前已经处理完的其他文件夹的
+    心跳记录，全部跟着白跑(2026-09-25发现aliyun_sync_events是空的就是
+    因为这个：中途Ctrl-C，从来没走到过最后那次commit)。"""
     cli = _build_cli()
     drives = await asyncio.to_thread(list_drives, cli, settings.aliyun_spaces)
     for drive in drives:
         leaf_folders = await asyncio.to_thread(_walk_leaf_folders, cli, drive)
         for folder in leaf_folders:
             await _process_folder(session, cli, folder)
-    await session.commit()
+            await session.commit()

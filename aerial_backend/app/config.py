@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     # 连续多少次心跳大小/文件数都没变，才判定"上传完成"(6小时一次心跳，
     # 8次=2天)
     aliyun_stability_scans_required: int = 8
+    # 下载单个文件用的超时(秒)，跟list-file这类快调用的60s默认超时分开——
+    # 航测视频单个文件常常几GB，60s不够传完(见2026-09-25实际报警)
+    aliyun_download_timeout_seconds: int = 1800
 
 
 settings = Settings()
