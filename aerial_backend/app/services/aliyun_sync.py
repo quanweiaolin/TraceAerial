@@ -91,6 +91,7 @@ async def ensure_enough_space(path: str | Path, min_free_gb: float | None = None
     free_gb = free_space_gb(path)
     if free_gb >= threshold:
         return True
+    print(f"[aliyun] 磁盘空间不足：{path} 剩余 {free_gb:.1f} GiB，低于阈值 {threshold:.0f} GiB", flush=True)
     await send_feishu_message(
         f"⚠️ 磁盘空间不足，暂停阿里云下载：{path} 所在盘剩余 {free_gb:.1f} GiB，"
         f"低于阈值 {threshold:.0f} GiB"
@@ -230,6 +231,21 @@ async def _download_folder_files(folder: dict[str, Any], cli: PdsCli) -> list[di
     return downloaded
 
 
+def _log_download_detail(context: str, folder_path: str, downloaded: list[dict[str, Any]]) -> None:
+    """log里给"这次下载具体怎么样"用的详细版本，比飞书消息内容更全——每个
+    文件的下载结果(状态/本地路径/失败原因)都列出来。只在真的触发下载动作
+    时打印一次(不是每次心跳都打)，不会刷屏。"""
+    print(f"[aliyun] {context}：{folder_path}", flush=True)
+    for d in downloaded:
+        name = d.get("cloud_path") or d.get("cloud_file_id")
+        status = d.get("download_status")
+        if status == "failed":
+            detail = f"error={d.get('error')}"
+        else:
+            detail = f"-> {d.get('local_path')}"
+        print(f"[aliyun]   {status:<10} {name} {detail}", flush=True)
+
+
 def _download_summary_line(downloaded: list[dict[str, Any]]) -> str:
     """按download_item实际返回的status分类计数，跟"总共尝试了几个文件"分开说，
     避免"已下载N个"这种表述在N个其实都是已存在跳过时显得有误导。"""
@@ -258,6 +274,7 @@ async def _trigger_download(
     downloaded = await _download_folder_files(folder, cli)
     download_finished_at = datetime.now(timezone.utc)
     all_succeeded = all(d.get("download_status") != "failed" for d in downloaded)
+    _log_download_detail("文件夹判定上传完成，开始下载", folder_path, downloaded)
 
     session.add(AliyunSyncEvent(
         event_type="folder_ready",
@@ -276,7 +293,7 @@ async def _trigger_download(
     ))
     if all_succeeded:
         await send_feishu_message(
-            f"✅ 阿里云文件夹上传完成：{folder_path}\n{_download_summary_line(downloaded)}"
+            f"✅ 阿里云文件夹下载完成：{folder_path}\n{_download_summary_line(downloaded)}"
         )
     else:
         await send_feishu_message(
@@ -294,6 +311,7 @@ async def _handle_reupload(
     download_started_at = datetime.now(timezone.utc)
     downloaded = await _download_folder_files(folder, cli)
     download_finished_at = datetime.now(timezone.utc)
+    _log_download_detail("完成后又有新上传，继续下载", folder_path, downloaded)
 
     session.add(AliyunSyncEvent(
         event_type="issue",
@@ -331,6 +349,7 @@ async def _handle_possible_deletion(
         notified_at=datetime.now(timezone.utc),
     ))
     detail = "、".join(missing_names) if missing_names else "(具体文件名对比不出来，可能是历史记录不足)"
+    print(f"[aliyun] 完成后检测到文件被删除：{folder_path}，疑似丢失：{detail}", flush=True)
     await send_feishu_message(
         f"⚠️ 已判定完成的文件夹里有文件不见了：{folder_path}，疑似被删除：{detail}"
     )
@@ -389,8 +408,11 @@ async def run_aliyun_scan(session: AsyncSession) -> None:
     因为这个：中途Ctrl-C，从来没走到过最后那次commit)。"""
     cli = _build_cli()
     drives = await asyncio.to_thread(list_drives, cli, settings.aliyun_spaces)
+    folder_count = 0
     for drive in drives:
         leaf_folders = await asyncio.to_thread(_walk_leaf_folders, cli, drive)
         for folder in leaf_folders:
             await _process_folder(session, cli, folder)
             await session.commit()
+            folder_count += 1
+    print(f"[aliyun] 扫描完成: drive_count={len(drives)} folder_count={folder_count}", flush=True)

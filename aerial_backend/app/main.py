@@ -9,6 +9,7 @@
          补"扫盘时SRT文件还没复制完"导致的GPS缺失)
 """
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
@@ -54,7 +55,11 @@ async def scheduled_metadata_backfill() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    scheduler.add_job(scheduled_scan, "interval", hours=1, id="scan")
+    # interval任务默认第一次触发时间是"现在+间隔"，不是启动后马上跑——
+    # 显式传next_run_time=启动时刻，让它启动后立刻跑一次，之后再按间隔重复，
+    # 不用每次重启服务都傻等一整个间隔才看到第一次结果
+    now = datetime.now()
+    scheduler.add_job(scheduled_scan, "interval", hours=1, id="scan", next_run_time=now)
     # scheduler.add_job(scheduled_notify, "interval", hours=1, id="notify")
     # 每天早上9点发一次汇总；具体统计口径见 services/notifier.send_daily_summary，
     # 后续要加新指标只用改那个函数，这里的调度不用动
@@ -64,7 +69,7 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(
         scheduled_metadata_backfill, "cron", hour=8, minute=45, id="metadata_backfill"
     )
-    scheduler.add_job(scheduled_aliyun_scan, "interval", hours=6, id="aliyun_scan")
+    scheduler.add_job(scheduled_aliyun_scan, "interval", hours=6, id="aliyun_scan", next_run_time=now)
     scheduler.start()
     yield
     scheduler.shutdown()

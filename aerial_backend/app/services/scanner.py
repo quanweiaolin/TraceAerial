@@ -181,4 +181,9 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
     job.finished_at = datetime.now(timezone.utc)
 
     await session.commit()
+    print(
+        f"[scan] 扫描完成: root={root_path} files_found={files_found} "
+        f"files_new={files_new} files_duplicate={files_duplicate}",
+        flush=True,
+    )
     return job
