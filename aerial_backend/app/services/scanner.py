@@ -145,7 +145,14 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
 
             if is_re_encode:
                 # 旧记录软删除下线，不物理删除，历史数据还在；不发即时飞书通知，
-                # 走每日汇总(services/notifier.send_daily_summary)统计"今日更新了多少视频"
+                # 走每日汇总(services/notifier.send_daily_summary)统计"今日更新了多少视频"。
+                # 汇总要等第二天9点才发、还按天切窗口，扫描当下看不出真实检测到几个，
+                # 所以这里直接打印，扫完数一下log就知道这次扫描实际检测到多少次瘦身更新
+                print(
+                    f"[scan] 检测到瘦身转码: {path}  "
+                    f"{old_active.sha256.hex()[:12]}... -> {digest.hex()[:12]}...",
+                    flush=True,
+                )
                 old_active.deleted_at = datetime.now(timezone.utc)
             else:
                 # 真新增：insert videos 会触发DB里 trg_init_pipeline_status(若已建)，
