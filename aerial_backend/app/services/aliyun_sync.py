@@ -8,7 +8,11 @@
      写一条新的心跳记录(变了才存完整文件列表，见add_aliyun_folder_scans.sql)
   3. 还没判定完成(aliyun_sync_events里没有它的folder_ready事件)的文件夹：
      检查是否连续N次心跳都没变化(N=settings.aliyun_stability_scans_required)，
-     稳定了就检查磁盘空间→下载到本地暂存目录→写folder_ready事件
+     稳定了就先校验次顶层目录名是否符合"年份_城市_AerialVideos_季度"这个
+     命名规范(不符合直接拒绝下载，见_validate_top_level_folder)→检查磁盘
+     空间→下载到settings.aliyun_download_dir(生产环境直接配成NAS真实路径，
+     不再经过SSD暂存)→全部文件下载成功后，对这个文件夹调用scanner.run_scan
+     扫描入videos库→写folder_ready事件(scan失败也算没完成，不单独标记)
   4. 已经判定完成的文件夹继续被监控：
      - 又有新文件/变大 → 飞书提示(不是错误，继续下载新增部分) +
        写issue事件(reupload_after_complete)
@@ -17,13 +21,12 @@
 
 不做的事(明确暂缓，见项目里的讨论记录)：
   - unknown_uploader检测(飞手归属要靠按人分文件夹的真实结构，测试数据还没有)
-  - 下载完之后自动整理/移到NAS(SSD到HDD的搬运，还没规划)
-  - 下载后自动写入videos表(前置检查条件还没做，先只落地文件)
 """
 from __future__ import annotations
 
 import asyncio
 import os
+import re
 import secrets
 import shutil
 import sys
@@ -38,6 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.models import AliyunFolderScan, AliyunSyncEvent
 from app.services.notifier import send_feishu_message
+from app.services.scanner import run_scan
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PDS_TOOL_ROOT = REPO_ROOT / "extern" / "pds-drive-sync"
@@ -74,6 +78,25 @@ def _build_download_cli() -> PdsCli:
     'Aliyun CLI timed out after 60s')。用settings.aliyun_download_timeout_seconds
     单独给一个大得多的超时，不影响其他快调用的"快速失败"特性。"""
     return PdsCli(_cli_binary_path(), timeout_seconds=settings.aliyun_download_timeout_seconds)
+
+
+# 次顶层文件夹(PDS根目录下第一层)命名规范：年份_城市_AerialVideos_季度，
+# 例如 2026_Changchun_AerialVideos_Q1。不符合这个规范的文件夹，见
+# _validate_top_level_folder，直接拒绝下载，不能走到"落盘"这一步。
+TOP_LEVEL_FOLDER_RE = re.compile(r"^\d{4}_[A-Za-z]+_AerialVideos_Q[1-4]$")
+
+
+def _top_level_folder_name(cloud_folder_path: str) -> str | None:
+    """从完整云端路径里取出根目录下第一层(次顶层)文件夹名。
+    cloud_folder_path形如"/2026_Changchun_AerialVideos_Q1/xxx/DJI_xxx"，
+    parts[0]是"/"本身，parts[1]才是次顶层文件夹。"""
+    parts = PurePosixPath(cloud_folder_path).parts
+    return parts[1] if len(parts) > 1 else None
+
+
+def _validate_top_level_folder(cloud_folder_path: str) -> bool:
+    name = _top_level_folder_name(cloud_folder_path)
+    return name is not None and TOP_LEVEL_FOLDER_RE.match(name) is not None
 
 
 def free_space_gb(path: str | Path) -> float:
@@ -176,6 +199,20 @@ async def _latest_ready_event(session: AsyncSession, cloud_folder_id: str) -> Al
         select(AliyunSyncEvent)
         .where(AliyunSyncEvent.cloud_folder_id == cloud_folder_id)
         .where(AliyunSyncEvent.event_type == "folder_ready")
+        .order_by(AliyunSyncEvent.created_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def _latest_issue_event(
+    session: AsyncSession, cloud_folder_id: str, issue_type: str
+) -> AliyunSyncEvent | None:
+    result = await session.execute(
+        select(AliyunSyncEvent)
+        .where(AliyunSyncEvent.cloud_folder_id == cloud_folder_id)
+        .where(AliyunSyncEvent.event_type == "issue")
+        .where(AliyunSyncEvent.issue_type == issue_type)
         .order_by(AliyunSyncEvent.created_at.desc())
         .limit(1)
     )
@@ -328,6 +365,35 @@ async def _trigger_download(
     scan_completed_at: datetime,
 ) -> None:
     folder_path = folder["cloud_folder_path"]
+
+    if not _validate_top_level_folder(folder_path):
+        # 次顶层目录名不符合"年份_城市_AerialVideos_季度"规范，直接拒绝下载。
+        # 只在第一次检测到时报警+记一条issue事件，避免同一个问题每6小时刷一次飞书；
+        # 人工把目录名改对之后，下次心跳会重新判定，不需要额外的"解除标记"操作
+        already_flagged = await _latest_issue_event(
+            session, folder["cloud_folder_id"], "invalid_top_level_name"
+        )
+        if already_flagged is None:
+            top_name = _top_level_folder_name(folder_path)
+            session.add(AliyunSyncEvent(
+                event_type="issue",
+                issue_type="invalid_top_level_name",
+                cloud_folder_id=folder["cloud_folder_id"],
+                cloud_folder_path=folder_path,
+                videos=[],
+                notified_at=datetime.now(timezone.utc),
+            ))
+            print(
+                f"[aliyun] 次顶层文件夹命名不符合规范，拒绝下载：{folder_path} "
+                f"(次顶层目录名={top_name})",
+                flush=True,
+            )
+            await send_feishu_message(
+                f"⚠️ 文件夹命名不符合规范(应为 年份_城市_AerialVideos_季度，"
+                f"如 2026_Changchun_AerialVideos_Q1)，已跳过下载：{folder_path}"
+            )
+        return
+
     if not await ensure_enough_space(settings.aliyun_download_dir):
         return  # 磁盘不够，飞书已经发过了，等下次心跳再试
 
@@ -337,6 +403,22 @@ async def _trigger_download(
     all_succeeded = all(d.get("download_status") != "failed" for d in downloaded)
     _log_download_detail("文件夹判定上传完成，开始下载", folder_path, downloaded)
 
+    scanned_in = False
+    if all_succeeded:
+        # 全部文件下载成功后，才把这个文件夹扫描进videos库——跟scanner.py的
+        # 常规定时扫盘复用同一套逻辑(哈希去重/瘦身检测/飞书通知都一样)，
+        # 只是触发时机和范围精确到"刚下载完的这一个文件夹"，不用等下一次
+        # 全量扫盘。scan失败也算这次没完成，不标记download_finished_at，
+        # 下次心跳(云端内容没变、还在"稳定"状态)会自动整体重试
+        local_folder = Path(settings.aliyun_download_dir).resolve() / PurePosixPath(folder_path).relative_to("/")
+        try:
+            await run_scan(session, str(local_folder))
+            scanned_in = True
+        except Exception as exc:  # noqa: BLE001  范围特意放宽：扫描入库这一步绝不能让整个扫描循环中断
+            print(f"[aliyun] 下载完成但扫描入库失败：{local_folder}  {exc}", flush=True)
+            await send_feishu_message(f"⚠️ 阿里云下载完成但扫描入库失败：{folder_path}\n{exc}")
+    all_succeeded = all_succeeded and scanned_in
+
     session.add(AliyunSyncEvent(
         event_type="folder_ready",
         cloud_folder_id=folder["cloud_folder_id"],
@@ -344,21 +426,21 @@ async def _trigger_download(
         videos=downloaded,
         scan_completed_at=scan_completed_at,
         download_started_at=download_started_at,
-        # 只有全部文件都成功才标记download_finished_at，
-        # 这样_latest_ready_event判断"已完成"才会准确——只要有文件失败，
+        # 只有"全部文件下载成功 + 扫描入库成功"才标记download_finished_at，
+        # 这样_latest_ready_event判断"已完成"才会准确——只要有一步失败，
         # 这里就留空，下次心跳(云端内容没变、还是"稳定"状态)会自动重新
-        # 触发一次完整的下载尝试，已成功的文件靠download_item的哈希跳过，
-        # 只会真正重试失败的那个
+        # 触发一次完整的流程，已成功的部分(下载/扫描)靠各自的幂等逻辑跳过，
+        # 只会真正重试失败的那部分
         download_finished_at=download_finished_at if all_succeeded else None,
         notified_at=datetime.now(timezone.utc),
     ))
     if all_succeeded:
         await send_feishu_message(
-            f"✅ 阿里云文件夹下载完成：{folder_path}\n{_download_summary_line(downloaded)}"
+            f"✅ 阿里云文件夹下载完成并已扫描入库：{folder_path}\n{_download_summary_line(downloaded)}"
         )
     else:
         await send_feishu_message(
-            f"⚠️ 阿里云文件夹下载未全部成功，下次心跳会自动重试：{folder_path}\n{_download_summary_line(downloaded)}"
+            f"⚠️ 阿里云文件夹处理未全部成功，下次心跳会自动重试：{folder_path}\n{_download_summary_line(downloaded)}"
         )
 
 

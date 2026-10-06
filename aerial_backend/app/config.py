@@ -33,9 +33,11 @@ class Settings(BaseSettings):
     aliyun_cli_binary: str = ""
     # PDS哪几个空间要扫，跟pds-drive-sync自己的默认一致
     aliyun_spaces: list[str] = ["personal", "team", "enterprise"]
-    # 下载暂存目录(SSD，不是最终NAS落盘位置，也不在scan_roots扫盘范围内)
+    # 下载落地根目录。默认是repo下的data/(本地测试用的SSD暂存目录)，
+    # 生产环境在.env里配成真实的NAS路径(比如/mnt/Expansion2/Aerial_Raw_Videos)，
+    # 下载完成后会自动scanner.run_scan扫描进videos库，见services/aliyun_sync.py
     aliyun_download_dir: str = "data"
-    # 下载前检查这块SSD剩余空间(GiB)，不够就飞书提示、不下载
+    # 下载前检查这个目录所在盘的剩余空间(GiB)，不够就飞书提示、不下载
     aliyun_min_free_gb: int = 200
     # 连续多少次心跳大小/文件数都没变，才判定"上传完成"(6小时一次心跳，
     # 8次=2天)
