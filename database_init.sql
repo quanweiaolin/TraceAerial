@@ -1,5 +1,5 @@
-CREATE DATABASE aerial_db; 
--- CREATE ROLE ad4che WITH LOGIN PASSWORD ad4che 已存在ad4che,密码也是ad4che
+CREATE DATABASE aerial_db;
+-- CREATE ROLE ad4che WITH LOGIN PASSWORD '<填自己的密码>';  -- 角色已存在就跳过这行
 \c aerial_db;
 GRANT CONNECT ON DATABASE aerial_db TO ad4che;
 GRANT CREATE ON DATABASE aerial_db TO ad4che;

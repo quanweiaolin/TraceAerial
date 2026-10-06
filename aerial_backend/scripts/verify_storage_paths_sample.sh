@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # 随机抽样检查videos.storage_path记录的路径在磁盘上是否真实存在，
 # 用于验证扫盘/路径迁移之后DB和磁盘没有对不上的情况。
-# 用法: ./verify_storage_paths_sample.sh [database_url] [抽样条数，默认100]
+# 用法: ./verify_storage_paths_sample.sh <database_url> [抽样条数，默认100]
 set -euo pipefail
 
-DATABASE_URL="${1:-postgresql://reader:reader@localhost:5432/aerial_db}"
+if [ -z "${1:-}" ]; then
+  echo "用法: $0 postgresql://reader:<password>@localhost:5432/aerial_db [抽样条数]" >&2
+  exit 1
+fi
+DATABASE_URL="$1"
 SAMPLE_SIZE="${2:-100}"
 
 paths=$(psql "$DATABASE_URL" -t -A \

@@ -33,13 +33,13 @@
 
 表建在 `aerial` 这个schema下（不是默认的 `public`），下面几种方式都要注意这点。
 
-学生/外部人员统一用只读账户 `reader`（密码 `reader`），只能查询、不能改数据，
-下面的例子都用这个账户。不要用管理员账户连库。
+学生/外部人员统一用只读账户 `reader`（密码找项目负责人要，不写进代码库），只能
+查询、不能改数据，下面的例子都用这个账户。不要用管理员账户连库。
 
 ### 1. shell（psql）
 
 ```bash
-psql "postgresql://reader:reader@localhost:5432/aerial_db"
+psql "postgresql://reader:<password>@localhost:5432/aerial_db"
 ```
 
 ```sql
@@ -52,7 +52,7 @@ SELECT * FROM videos LIMIT 5;
 一次性查询（不进交互模式）：
 
 ```bash
-psql "postgresql://reader:reader@localhost:5432/aerial_db" \
+psql "postgresql://reader:<password>@localhost:5432/aerial_db" \
   -c "SET search_path TO aerial, public;" \
   -c "SELECT storage_path, created_at FROM videos ORDER BY created_at DESC LIMIT 5;"
 ```
@@ -65,7 +65,7 @@ import asyncpg
 
 async def main():
     conn = await asyncpg.connect(
-        host="localhost", port=5432, user="reader", password="reader", database="aerial_db",
+        host="localhost", port=5432, user="reader", password="<password>", database="aerial_db",
         server_settings={"search_path": "aerial,public"},
     )
     rows = await conn.fetch("SELECT storage_path, created_at FROM videos LIMIT 5;")
