@@ -1,18 +1,32 @@
 """
 阿里云PDS自动下载流程。计划由APScheduler每6小时调一次 run_aliyun_scan。
 
+云端目录结构：飞手上传时只负责建"飞行会话文件夹"(命名规范见
+SESSION_FOLDER_RE，例如 ChangChun_PanShiRoad_Mavic3E_200m_wangziyu_20260912)，
+这个文件夹深度不固定(可能直接在某个空间根目录下，也可能被套了别的组织性
+目录)，所以遍历时不按固定层级找，而是在整棵目录树里按"文件夹名字是不是
+符合会话命名规范"来identify——哪一层先出现这个命名规范，哪一层就是要监控
+的最小单位，不用再继续往下找(M3E系列这个文件夹下面还会套一层DJI_xxx才是
+真正装MP4/SRT的目录，Mini/Air系列这个文件夹本身就直接装文件，两种都要把
+这个文件夹下全部文件(不管嵌套多深)当成一个整体收集)。
+"年份_城市_AerialVideos_季度"这个分类文件夹不是云端已有的东西，是本地落盘
+时我们自己从会话文件夹名里解析出城市+日期算出来的，拼在本地路径最外层，
+不要求云端真的存在这层。
+
 流程：
-  1. 遍历PDS每个可访问的drive，找出全部"叶子文件夹"(不含子文件夹、直接装着
-     MP4/SRT等文件的目录) —— 这就是要监控的最小单位
-  2. 每个叶子文件夹跟aliyun_folder_scans里它自己最新一行比大小/文件数，
-     写一条新的心跳记录(变了才存完整文件列表，见add_aliyun_folder_scans.sql)
-  3. 还没判定完成(aliyun_sync_events里没有它的folder_ready事件)的文件夹：
-     检查是否连续N次心跳都没变化(N=settings.aliyun_stability_scans_required)，
-     稳定了就先校验次顶层目录名是否符合"年份_城市_AerialVideos_季度"这个
-     命名规范(不符合直接拒绝下载，见_validate_top_level_folder)→检查磁盘
-     空间→下载到settings.aliyun_download_dir(生产环境直接配成NAS真实路径，
-     不再经过SSD暂存)→全部文件下载成功后，对这个文件夹调用scanner.run_scan
-     扫描入videos库→写folder_ready事件(scan失败也算没完成，不单独标记)
+  1. 遍历PDS每个可访问的drive：文件夹名符合会话命名规范 → 收集为一个监控
+     单位；文件夹名"像"会话命名但没完全对上(比如设备型号拼错/不在白名单)
+     → 直接拒绝(报警，不再往下探索)；完全不沾边的文件夹(比如还没整理的
+     组织性目录) → 继续往下探索子目录
+  2. 每个监控单位跟aliyun_folder_scans里它自己最新一行比大小/文件数(递归
+     统计，不只是直接子文件)，写一条新的心跳记录(变了才存完整文件列表)
+  3. 还没判定完成(aliyun_sync_events里没有它的folder_ready事件)的，连续N次
+     心跳都没变化(N=settings.aliyun_stability_scans_required)就判定"上传
+     完成"：检查磁盘空间→下载到settings.aliyun_download_dir/<算出来的年份_
+     城市_AerialVideos_季度>/<会话文件夹名>/<相对路径>(生产环境download_dir
+     直接配成NAS真实路径，不再经过SSD暂存)→全部文件下载成功后，对这个
+     本地目录调用scanner.run_scan扫描入videos库→写folder_ready事件
+     (下载/扫描任一步失败都算没完成，不单独标记，下次心跳自动整体重试)
   4. 已经判定完成的文件夹继续被监控：
      - 又有新文件/变大 → 飞书提示(不是错误，继续下载新增部分) +
        写issue事件(reupload_after_complete)
@@ -32,7 +46,7 @@ import shutil
 import sys
 from collections import deque
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import select
@@ -80,23 +94,66 @@ def _build_download_cli() -> PdsCli:
     return PdsCli(_cli_binary_path(), timeout_seconds=settings.aliyun_download_timeout_seconds)
 
 
-# 次顶层文件夹(PDS根目录下第一层)命名规范：年份_城市_AerialVideos_季度，
-# 例如 2026_Changchun_AerialVideos_Q1。不符合这个规范的文件夹，见
-# _validate_top_level_folder，直接拒绝下载，不能走到"落盘"这一步。
-TOP_LEVEL_FOLDER_RE = re.compile(r"^\d{4}_[A-Za-z]+_AerialVideos_Q[1-4]$")
+# 飞行会话文件夹命名规范：City_Site_Drone_Height_Person_Date，
+# 例如 ChangChun_PanShiRoad_Mavic3E_200m_wangziyu_20260912。
+#   City   采集地点城市，拼音，每个字首字母大写，如 BeiJing
+#   Site   地点名，拼音，每个单词首字母大写，如 PanShiRoad
+#   Drone  设备型号，固定白名单(SESSION_FOLDER_DEVICES)，不在名单里的一律
+#          拒绝——宁可先报错拦下来，也不要静默收了一个拼错/没见过的机型名
+#   Height 采集高度，数字+小写m，如 200m
+#   Person 采集人员姓名拼音，全小写，如 wangziyu
+#   Date   上传日期 YYYYMMDD
+SESSION_FOLDER_DEVICES = ("Mavic3E", "Air2S", "Air3S", "Mini4Pro", "Mini3Pro")
+SESSION_FOLDER_RE = re.compile(
+    r"^(?P<city>[A-Z][a-zA-Z]*)_(?P<site>[A-Z][a-zA-Z]*)_"
+    r"(?P<drone>" + "|".join(SESSION_FOLDER_DEVICES) + r")_"
+    r"(?P<height>\d+)m_(?P<person>[a-z]+)_(?P<date>\d{8})$"
+)
 
 
-def _top_level_folder_name(cloud_folder_path: str) -> str | None:
-    """从完整云端路径里取出根目录下第一层(次顶层)文件夹名。
-    cloud_folder_path形如"/2026_Changchun_AerialVideos_Q1/xxx/DJI_xxx"，
-    parts[0]是"/"本身，parts[1]才是次顶层文件夹。"""
-    parts = PurePosixPath(cloud_folder_path).parts
-    return parts[1] if len(parts) > 1 else None
+_SESSION_FOLDER_DEVICES_LOWER = {device.lower() for device in SESSION_FOLDER_DEVICES}
 
 
-def _validate_top_level_folder(cloud_folder_path: str) -> bool:
-    name = _top_level_folder_name(cloud_folder_path)
-    return name is not None and TOP_LEVEL_FOLDER_RE.match(name) is not None
+def _diagnose_session_folder_name(name: str) -> list[str]:
+    """给命名不规范的候选文件夹做字段级别的诊断，返回具体哪几个字段哪里错了
+    (而不是笼统地说"不符合规范")，报警/log都用这个，方便人一眼定位要改哪里。"""
+    parts = name.split("_")
+    if len(parts) != 6:
+        return [f"应该是 City_Site_Drone_Height_Person_Date 共6段(用_分隔)，实际是{len(parts)}段"]
+    city, site, drone, height, person, date = parts
+    reasons = []
+    if not re.fullmatch(r"[A-Z][a-zA-Z]*", city):
+        reasons.append(f"City字段{city!r}应为拼音且首字母大写，如BeiJing")
+    if not re.fullmatch(r"[A-Z][a-zA-Z]*", site):
+        reasons.append(f"Site字段{site!r}应为拼音且每个单词首字母大写，如PanShiRoad")
+    if drone not in SESSION_FOLDER_DEVICES:
+        devices = "/".join(SESSION_FOLDER_DEVICES)
+        reasons.append(f"Drone字段{drone!r}不在设备白名单里，只认{devices}")
+    if not re.fullmatch(r"\d+m", height):
+        reasons.append(f"Height字段{height!r}应为数字+小写m，如200m")
+    if not re.fullmatch(r"[a-z]+", person):
+        reasons.append(f"Person字段{person!r}应全部小写，如wangziyu")
+    if not re.fullmatch(r"\d{8}", date):
+        reasons.append(f"Date字段{date!r}应为8位数字YYYYMMDD，如20260912")
+    return reasons or ["跟规范整体对不上，但逐字段检查没发现具体问题，可能是分隔符本身有问题"]
+
+
+def _looks_like_session_candidate(name: str) -> bool:
+    """名字里有没有出现过设备型号白名单里的词——用来判断这个文件夹"像"是在
+    想当会话文件夹、只是没完全写对(该报错拦下来)，还是纯粹的组织性目录
+    (该继续往下探索)。按"_"分段做整段匹配，不是子串匹配，避免误伤；大小写
+    不敏感——"Mini3pro"这种大小写写错的也该被拦下来报错，而不是因为没有
+    精确匹配上白名单就被当成无关目录静默放过。"""
+    return any(segment.lower() in _SESSION_FOLDER_DEVICES_LOWER for segment in name.split("_"))
+
+
+def _derive_category_folder(match: re.Match) -> str:
+    """从会话文件夹名解析出的城市+日期，算出本地落盘要用的分类文件夹名
+    (年份_城市_AerialVideos_季度)。这一层云端不存在，是我们本地自己拼的。"""
+    date = match.group("date")
+    year = date[:4]
+    quarter = (int(date[4:6]) - 1) // 3 + 1
+    return f"{year}_{match.group('city')}_AerialVideos_Q{quarter}"
 
 
 def free_space_gb(path: str | Path) -> float:
@@ -129,6 +186,7 @@ def _file_entry(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "file_id": str(item.get("file_id") or ""),
         "name": item.get("name"),
+        "relative_path": item.get("relative_path"),
         "size_bytes": int(item.get("size") or 0),
         "content_hash": item.get("content_hash"),
         "content_hash_algo": item.get("content_hash_name"),
@@ -136,42 +194,85 @@ def _file_entry(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _walk_leaf_folders(cli: PdsCli, drive: dict[str, Any]) -> list[dict[str, Any]]:
-    """BFS遍历一个drive，找出全部"叶子文件夹"(不含子文件夹、直接装文件的目录)。
-    是同步阻塞调用(内部是subprocess)，调用方要丢进线程池。"""
+def _list_children(cli: PdsCli, drive_id: str, parent_id: str) -> list[dict[str, Any]]:
+    return _paginate(
+        cli,
+        [
+            "list-file",
+            "--drive-id", drive_id,
+            "--parent-file-id", parent_id,
+            "--limit", "100",
+            "--cli-query", ITEM_PROJECTION,
+        ],
+    )
+
+
+def _gather_all_files(cli: PdsCli, drive_id: str, start_file_id: str) -> list[dict[str, Any]]:
+    """递归收集一个文件夹下全部文件(不管嵌套多深，比如M3E系列会话文件夹下面
+    还套了一层DJI_xxx)，每个文件附带relative_path(相对这个起始文件夹的相对
+    路径，POSIX斜杠分隔)，用来还原本地落盘时的目录结构。"""
+    collected: list[dict[str, Any]] = []
+    queue: deque[tuple[str, str]] = deque([(start_file_id, "")])
+    while queue:
+        parent_id, prefix = queue.popleft()
+        for item in _list_children(cli, drive_id, parent_id):
+            name = item.get("name") or ""
+            relative = f"{prefix}/{name}" if prefix else name
+            if item.get("type") == "folder":
+                queue.append((str(item.get("file_id") or ""), relative))
+            else:
+                item = dict(item)
+                item["relative_path"] = relative
+                collected.append(item)
+    return collected
+
+
+def _walk_session_folders(
+    cli: PdsCli, drive: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """遍历一个drive，找出全部"飞行会话文件夹"(命名符合SESSION_FOLDER_RE)。
+    深度不固定——不管这个文件夹在目录树里多深，只要名字对上了就当成一个
+    监控单位，不用再继续往下找；名字不对但看着像(命中设备型号白名单)的，
+    当成命名错误拒绝，不再往下探索；完全不沾边的目录继续往下探索子目录。
+    是同步阻塞调用(内部是subprocess)，调用方要丢进线程池。
+    返回 (合法会话列表, 命名错误候选列表)。"""
     drive_id = str(drive.get("drive_id") or "")
     queue: deque[tuple[str, str]] = deque([("root", "/")])
     visited = {"root"}
-    leaf_folders: list[dict[str, Any]] = []
+    sessions: list[dict[str, Any]] = []
+    invalid_candidates: list[dict[str, Any]] = []
     while queue:
         parent_id, parent_path = queue.popleft()
-        children = _paginate(
-            cli,
-            [
-                "list-file",
-                "--drive-id", drive_id,
-                "--parent-file-id", parent_id,
-                "--limit", "100",
-                "--cli-query", ITEM_PROJECTION,
-            ],
-        )
-        subfolders = [c for c in children if c.get("type") == "folder"]
-        files = [c for c in children if c.get("type") == "file"]
-        for folder in subfolders:
-            file_id = str(folder.get("file_id") or "")
-            if file_id and file_id not in visited:
-                visited.add(file_id)
-                child_path = f"{parent_path.rstrip('/')}/{folder.get('name')}"
-                queue.append((file_id, child_path))
-        if files and not subfolders:
-            leaf_folders.append({
-                "drive_id": drive_id,
-                "space_type": drive.get("space_type"),
-                "cloud_folder_id": parent_id,
-                "cloud_folder_path": parent_path,
-                "raw_files": files,
-            })
-    return leaf_folders
+        for item in _list_children(cli, drive_id, parent_id):
+            if item.get("type") != "folder":
+                continue  # 散装文件(不属于任何会话文件夹)忽略，跟之前行为一致
+            file_id = str(item.get("file_id") or "")
+            if not file_id or file_id in visited:
+                continue
+            visited.add(file_id)
+            name = item.get("name") or ""
+            folder_path = f"{parent_path.rstrip('/')}/{name}"
+            match = SESSION_FOLDER_RE.match(name)
+            if match:
+                raw_files = _gather_all_files(cli, drive_id, file_id)
+                sessions.append({
+                    "drive_id": drive_id,
+                    "cloud_folder_id": file_id,
+                    "cloud_folder_path": folder_path,
+                    "category_folder": _derive_category_folder(match),
+                    "session_name": name,
+                    "raw_files": raw_files,
+                })
+            elif _looks_like_session_candidate(name):
+                invalid_candidates.append({
+                    "drive_id": drive_id,
+                    "cloud_folder_id": file_id,
+                    "cloud_folder_path": folder_path,
+                    "name": name,
+                })
+            else:
+                queue.append((file_id, folder_path))
+    return sessions, invalid_candidates
 
 
 async def _latest_scan(session: AsyncSession, cloud_folder_id: str) -> AliyunFolderScan | None:
@@ -232,29 +333,29 @@ async def _last_known_files(session: AsyncSession, cloud_folder_id: str) -> list
     return row.files if row is not None else None
 
 
-def _download_one_file(cli: PdsCli, cloud_path: str, raw_item: dict[str, Any], download_root: Path) -> dict[str, Any]:
+def _download_one_file(
+    cli: PdsCli, local_relative_path: str, raw_item: dict[str, Any], download_root: Path
+) -> dict[str, Any]:
     """同步阻塞调用(内部是subprocess)，调用方要丢进线程池。
 
-    不用pds_sync.core.download_item：它会把本地路径套一层"space_type-drive_id"
-    目录，但PDS的list-file返回里根本没有space_type这个字段(只有list-drive
-    才有)，导致这层目录永远是没有实际意义的"unknown-<drive_id>"(见
-    2026-09-25的讨论)。这里直接用BFS遍历时已经知道的cloud_path，本地路径
-    就是download_root+cloud_path，干净且不用再多调一次resolve-path API。
-    哈希跳过(_file_matches)/冲突改名(_conflict_path)逻辑跟download_item一致，
-    直接复用pds_sync.core里现成的纯函数。"""
+    不用pds_sync.core.download_item：它会把本地路径按云端路径1:1镜像，但
+    现在本地落盘结构是我们自己拼的(分类文件夹是本地算出来的，云端不存在)，
+    local_relative_path由调用方(_download_folder_files)算好传进来，不依赖
+    cloud_path/resolve-path API。哈希跳过(_file_matches)/冲突改名
+    (_conflict_path)逻辑跟download_item一致，直接复用pds_sync.core里现成
+    的纯函数。"""
     drive_id = str(raw_item.get("drive_id") or "")
     file_id = str(raw_item.get("file_id") or "")
     root = Path(download_root).resolve()
-    relative = PurePosixPath(cloud_path).relative_to("/")
-    target = (root / relative).resolve()
+    target = (root / local_relative_path).resolve()
     if not target.is_relative_to(root):
-        raise ValueError(f"云端路径逃出了下载目录: {cloud_path}")
+        raise ValueError(f"本地相对路径逃出了下载目录: {local_relative_path}")
     target.parent.mkdir(parents=True, exist_ok=True)
 
     status = "downloaded"
     if target.exists():
         if target.is_file() and _file_matches(raw_item, target):
-            return {"file_id": file_id, "cloud_path": cloud_path, "local_path": str(target), "status": "skipped"}
+            return {"file_id": file_id, "local_path": str(target), "status": "skipped"}
         target = _conflict_path(target, file_id)
         status = "conflicted"
 
@@ -280,7 +381,7 @@ def _download_one_file(cli: PdsCli, cloud_path: str, raw_item: dict[str, Any], d
             os.fsync(handle.fileno())
         os.replace(temporary, target)
         return {
-            "file_id": file_id, "cloud_path": cloud_path, "local_path": str(target),
+            "file_id": file_id, "local_path": str(target),
             "size": local_size, "status": status,
         }
     finally:
@@ -289,9 +390,13 @@ def _download_one_file(cli: PdsCli, cloud_path: str, raw_item: dict[str, Any], d
 
 
 async def _download_folder_files(folder: dict[str, Any], cli: PdsCli) -> list[dict[str, Any]]:
-    """下载文件夹里全部当前文件；已经下载过的会按哈希跳过(_download_one_file
-    内部逻辑)，所以对"完成后又有新增"这种情况重新调一次也是安全的、只会
-    真正下载新文件。
+    """下载文件夹里全部当前文件(含嵌套子目录里的)；已经下载过的会按哈希跳过
+    (_download_one_file内部逻辑)，所以对"完成后又有新增"这种情况重新调一次
+    也是安全的、只会真正下载新文件。
+
+    本地落盘路径 = download_root/category_folder/session_name/相对路径，
+    category_folder是本地算出来的"年份_城市_AerialVideos_季度"，不是云端
+    真实存在的目录。
 
     注意：不直接用传进来的cli(那个是给list-file这类快调用用的，超时只有
     60s)——航测视频单个文件常常几GB，60s传不完就会被判超时(见2026-09-25
@@ -301,13 +406,15 @@ async def _download_folder_files(folder: dict[str, Any], cli: PdsCli) -> list[di
     download_cli = _build_download_cli()
     downloaded: list[dict[str, Any]] = []
     for raw_item in folder["raw_files"]:
-        cloud_path = f"{folder_path.rstrip('/')}/{raw_item.get('name')}"
+        relative_path = raw_item.get("relative_path") or raw_item.get("name")
+        local_relative = f"{folder['category_folder']}/{folder['session_name']}/{relative_path}"
+        cloud_path = f"{folder_path.rstrip('/')}/{relative_path}"
         try:
             result = await asyncio.to_thread(
-                _download_one_file, download_cli, cloud_path, raw_item, Path(settings.aliyun_download_dir)
+                _download_one_file, download_cli, local_relative, raw_item, Path(settings.aliyun_download_dir)
             )
         except (PdsError, OSError, ValueError) as exc:
-            await send_feishu_message(f"⚠️ 阿里云下载失败：{folder_path} 里的 {raw_item.get('name')}：{exc}")
+            await send_feishu_message(f"⚠️ 阿里云下载失败：{folder_path} 里的 {relative_path}：{exc}")
             downloaded.append({
                 "cloud_file_id": raw_item.get("file_id"),
                 "cloud_path": cloud_path,
@@ -320,7 +427,7 @@ async def _download_folder_files(folder: dict[str, Any], cli: PdsCli) -> list[di
             continue
         downloaded.append({
             "cloud_file_id": result.get("file_id"),
-            "cloud_path": result.get("cloud_path"),
+            "cloud_path": cloud_path,
             "content_hash": raw_item.get("content_hash"),
             "content_hash_algo": raw_item.get("content_hash_name"),
             "local_path": result.get("local_path"),
@@ -357,6 +464,32 @@ def _download_summary_line(downloaded: list[dict[str, Any]]) -> str:
     )
 
 
+async def _report_invalid_session_name(session: AsyncSession, candidate: dict[str, Any]) -> None:
+    """文件夹名命中了设备型号白名单、但整体格式没对上SESSION_FOLDER_RE——
+    只在第一次检测到时报警+记一条issue事件，避免同一个问题每6小时刷一次
+    飞书；人工把目录名改对之后，下次心跳会重新判定，不需要额外的"解除标记"
+    操作。这类文件夹不会被收集文件/不会进入心跳监控，是终态的拒绝。"""
+    cloud_folder_id = candidate["cloud_folder_id"]
+    folder_path = candidate["cloud_folder_path"]
+    already_flagged = await _latest_issue_event(session, cloud_folder_id, "invalid_session_name")
+    if already_flagged is not None:
+        return
+    # 逐字段诊断，精确到"哪个字段、写的是什么、应该长什么样"，不是笼统的
+    # "不符合规范"——人一看报警就知道要去云端哪个文件夹改哪个字段
+    field_reasons = _diagnose_session_folder_name(candidate["name"])
+    reason = "；".join(field_reasons)
+    session.add(AliyunSyncEvent(
+        event_type="issue",
+        issue_type="invalid_session_name",
+        cloud_folder_id=cloud_folder_id,
+        cloud_folder_path=folder_path,
+        videos=[],
+        notified_at=datetime.now(timezone.utc),
+    ))
+    print(f"[aliyun] 命名不符合规范，拒绝下载：{folder_path}\n  {reason}", flush=True)
+    await send_feishu_message(f"⚠️ 文件夹命名不符合规范，已跳过下载：{folder_path}\n{reason}")
+
+
 async def _trigger_download(
     session: AsyncSession,
     cli: PdsCli,
@@ -365,34 +498,6 @@ async def _trigger_download(
     scan_completed_at: datetime,
 ) -> None:
     folder_path = folder["cloud_folder_path"]
-
-    if not _validate_top_level_folder(folder_path):
-        # 次顶层目录名不符合"年份_城市_AerialVideos_季度"规范，直接拒绝下载。
-        # 只在第一次检测到时报警+记一条issue事件，避免同一个问题每6小时刷一次飞书；
-        # 人工把目录名改对之后，下次心跳会重新判定，不需要额外的"解除标记"操作
-        already_flagged = await _latest_issue_event(
-            session, folder["cloud_folder_id"], "invalid_top_level_name"
-        )
-        if already_flagged is None:
-            top_name = _top_level_folder_name(folder_path)
-            session.add(AliyunSyncEvent(
-                event_type="issue",
-                issue_type="invalid_top_level_name",
-                cloud_folder_id=folder["cloud_folder_id"],
-                cloud_folder_path=folder_path,
-                videos=[],
-                notified_at=datetime.now(timezone.utc),
-            ))
-            print(
-                f"[aliyun] 次顶层文件夹命名不符合规范，拒绝下载：{folder_path} "
-                f"(次顶层目录名={top_name})",
-                flush=True,
-            )
-            await send_feishu_message(
-                f"⚠️ 文件夹命名不符合规范(应为 年份_城市_AerialVideos_季度，"
-                f"如 2026_Changchun_AerialVideos_Q1)，已跳过下载：{folder_path}"
-            )
-        return
 
     if not await ensure_enough_space(settings.aliyun_download_dir):
         return  # 磁盘不够，飞书已经发过了，等下次心跳再试
@@ -410,7 +515,7 @@ async def _trigger_download(
         # 只是触发时机和范围精确到"刚下载完的这一个文件夹"，不用等下一次
         # 全量扫盘。scan失败也算这次没完成，不标记download_finished_at，
         # 下次心跳(云端内容没变、还在"稳定"状态)会自动整体重试
-        local_folder = Path(settings.aliyun_download_dir).resolve() / PurePosixPath(folder_path).relative_to("/")
+        local_folder = Path(settings.aliyun_download_dir).resolve() / folder["category_folder"] / folder["session_name"]
         try:
             await run_scan(session, str(local_folder))
             scanned_in = True
@@ -542,7 +647,8 @@ async def _process_folder(session: AsyncSession, cli: PdsCli, folder: dict[str, 
 
 
 async def run_aliyun_scan(session: AsyncSession) -> None:
-    """完整跑一次：遍历全部drive的全部叶子文件夹，逐个记心跳、判断是否要下载/报警。
+    """完整跑一次：遍历全部drive，找出全部飞行会话文件夹，逐个记心跳、判断
+    是否要下载/报警；命名错误的候选文件夹单独报警，不进入监控。
 
     每个文件夹处理完就commit一次，不是等全部文件夹跑完才一次性commit——
     单个文件夹的下载可能要跑很久(大文件)，中途被Ctrl-C/进程被杀的话，
@@ -553,8 +659,11 @@ async def run_aliyun_scan(session: AsyncSession) -> None:
     drives = await asyncio.to_thread(list_drives, cli, settings.aliyun_spaces)
     folder_count = 0
     for drive in drives:
-        leaf_folders = await asyncio.to_thread(_walk_leaf_folders, cli, drive)
-        for folder in leaf_folders:
+        sessions, invalid_candidates = await asyncio.to_thread(_walk_session_folders, cli, drive)
+        for candidate in invalid_candidates:
+            await _report_invalid_session_name(session, candidate)
+            await session.commit()
+        for folder in sessions:
             await _process_folder(session, cli, folder)
             await session.commit()
             folder_count += 1
