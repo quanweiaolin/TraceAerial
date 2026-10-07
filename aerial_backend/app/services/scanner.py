@@ -13,6 +13,11 @@
            replaces_sha256指回旧sha256，不发即时通知(走每日汇总统计)
      - 已存在 -> 只关联 resolved_video_sha256，is_new_task=False，不重复建任务
        (同一内容换了路径/被复制，不应该产生第二条任务流)
+  4. storage_path里如果能找到符合"飞行会话文件夹"命名规范的那一段(City_Site_
+     Drone_Height_Person_Date，见services/session_naming.py)，顺带把
+     device_id/collected_by补上——设备型号/人名在devices/operators表里找不到
+     就自动建一条新记录(简单优先，发现拼写不一致导致的重复记录后续backfill
+     合并即可)，匹配不到(路径不符合这个命名规范)就保持原样不处理
 
 可以由 APScheduler 定时调用，也可以挂在 FastAPI 的 POST /scan/trigger 接口里异步跑。
 """
@@ -23,12 +28,51 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Notification, ScanDiscovery, ScanJob, Video
+from app.models import Device, Notification, Operator, ScanDiscovery, ScanJob, Video
 from app.services.hashing import compute_sha256
+from app.services.session_naming import find_session_match
 from app.services.video_metadata import extract_new_video_fields
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
 COMMIT_BATCH_SIZE = 100  # 每处理这么多个文件落库一次，避免大目录跑到一半被杀/OOM全部白扫
+
+
+async def _get_or_create_device(session: AsyncSession, model: str) -> int:
+    """按型号名找devices表，找不到就自动建一条(device_code就用型号名本身，
+    这类自动建的记录本来就没有单独的编号体系)。device_code是唯一索引，
+    保证不会重复建。"""
+    result = await session.execute(select(Device).where(Device.device_code == model))
+    device = result.scalar_one_or_none()
+    if device is None:
+        device = Device(device_code=model, model=model)
+        session.add(device)
+        await session.flush()
+    return device.device_id
+
+
+async def _get_or_create_operator(session: AsyncSession, username: str) -> int:
+    """按用户名(拼音)找operators表，找不到就自动建一条。飞手自己打的拼音
+    可能大小写/拼写不完全一致，导致同一个人建出多条记录——这个先接受，
+    发现问题后用backfill脚本合并，不在扫盘这里做复杂的模糊匹配。"""
+    result = await session.execute(select(Operator).where(Operator.username == username))
+    operator = result.scalar_one_or_none()
+    if operator is None:
+        operator = Operator(username=username)
+        session.add(operator)
+        await session.flush()
+    return operator.id
+
+
+async def _apply_session_metadata(session: AsyncSession, video: Video, storage_path: Path) -> None:
+    """从storage_path里找"飞行会话文件夹"命名规范的那一段(City_Site_Drone_
+    Height_Person_Date)，补上device_id/collected_by。找不到就什么都不做——
+    不是所有视频都来自这套命名规范(比如历史数据/其他来源)，这是尽力而为的
+    补全，不是强制要求。"""
+    match = find_session_match(storage_path)
+    if match is None:
+        return
+    video.device_id = await _get_or_create_device(session, match.group("drone"))
+    video.collected_by = await _get_or_create_operator(session, match.group("person"))
 
 
 async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
@@ -126,7 +170,7 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
 
             # 技术元数据(时长/分辨率/帧率/编码/collected_at)+GPS：ffprobe只读文件头，
             # 不会像sha256那样耗时；但内部调subprocess仍是阻塞调用，同样丢线程池，
-            # 不占用事件循环；device_id/collected_by保持不变，本次不处理
+            # 不占用事件循环
             new_fields = await asyncio.to_thread(extract_new_video_fields, path)
             video = Video(
                 sha256=digest,
@@ -137,6 +181,10 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
                 **new_fields,
             )
             session.add(video)
+            # storage_path里如果能解析出"飞行会话文件夹"命名规范(见
+            # services/session_naming.py)，顺带补上device_id/collected_by；
+            # 解析不出来就保持原样(不是所有视频都来自这套命名规范)
+            await _apply_session_metadata(session, video, path)
             await session.flush()  # 必须在这里flush，确保video先落库，
             # 不然下面Notification.video_sha256(外键指向videos.sha256)可能
             # 在同一次自动flush里insert顺序不对，报FK违反(见2026-09-07的事故)

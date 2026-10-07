@@ -2,7 +2,7 @@
 阿里云PDS自动下载流程。计划由APScheduler每6小时调一次 run_aliyun_scan。
 
 云端目录结构：飞手上传时只负责建"飞行会话文件夹"(命名规范见
-SESSION_FOLDER_RE，例如 ChangChun_PanShiRoad_Mavic3E_200m_wangziyu_20260912)，
+SESSION_FOLDER_RE，例如 changchun_panshiroad_m3e_200m_wangziyu_20260912)，
 这个文件夹深度不固定(可能直接在某个空间根目录下，也可能被套了别的组织性
 目录)，所以遍历时不按固定层级找，而是在整棵目录树里按"文件夹名字是不是
 符合会话命名规范"来identify——哪一层先出现这个命名规范，哪一层就是要监控
@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 import secrets
 import shutil
 import sys
@@ -56,6 +55,13 @@ from app.config import settings
 from app.models import AliyunFolderScan, AliyunSyncEvent
 from app.services.notifier import send_feishu_message
 from app.services.scanner import run_scan
+from app.services.session_naming import (
+    SESSION_FOLDER_DEVICES,
+    SESSION_FOLDER_RE,
+    derive_category_folder,
+    diagnose_session_folder_name,
+    looks_like_session_candidate,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PDS_TOOL_ROOT = REPO_ROOT / "extern" / "pds-drive-sync"
@@ -92,68 +98,6 @@ def _build_download_cli() -> PdsCli:
     'Aliyun CLI timed out after 60s')。用settings.aliyun_download_timeout_seconds
     单独给一个大得多的超时，不影响其他快调用的"快速失败"特性。"""
     return PdsCli(_cli_binary_path(), timeout_seconds=settings.aliyun_download_timeout_seconds)
-
-
-# 飞行会话文件夹命名规范：City_Site_Drone_Height_Person_Date，
-# 例如 ChangChun_PanShiRoad_Mavic3E_200m_wangziyu_20260912。
-#   City   采集地点城市，拼音，每个字首字母大写，如 BeiJing
-#   Site   地点名，拼音，每个单词首字母大写，如 PanShiRoad
-#   Drone  设备型号，固定白名单(SESSION_FOLDER_DEVICES)，不在名单里的一律
-#          拒绝——宁可先报错拦下来，也不要静默收了一个拼错/没见过的机型名
-#   Height 采集高度，数字+小写m，如 200m
-#   Person 采集人员姓名拼音，全小写，如 wangziyu
-#   Date   上传日期 YYYYMMDD
-SESSION_FOLDER_DEVICES = ("Mavic3E", "Air2S", "Air3S", "Mini4Pro", "Mini3Pro")
-SESSION_FOLDER_RE = re.compile(
-    r"^(?P<city>[A-Z][a-zA-Z]*)_(?P<site>[A-Z][a-zA-Z]*)_"
-    r"(?P<drone>" + "|".join(SESSION_FOLDER_DEVICES) + r")_"
-    r"(?P<height>\d+)m_(?P<person>[a-z]+)_(?P<date>\d{8})$"
-)
-
-
-_SESSION_FOLDER_DEVICES_LOWER = {device.lower() for device in SESSION_FOLDER_DEVICES}
-
-
-def _diagnose_session_folder_name(name: str) -> list[str]:
-    """给命名不规范的候选文件夹做字段级别的诊断，返回具体哪几个字段哪里错了
-    (而不是笼统地说"不符合规范")，报警/log都用这个，方便人一眼定位要改哪里。"""
-    parts = name.split("_")
-    if len(parts) != 6:
-        return [f"应该是 City_Site_Drone_Height_Person_Date 共6段(用_分隔)，实际是{len(parts)}段"]
-    city, site, drone, height, person, date = parts
-    reasons = []
-    if not re.fullmatch(r"[A-Z][a-zA-Z]*", city):
-        reasons.append(f"City字段{city!r}应为拼音且首字母大写，如BeiJing")
-    if not re.fullmatch(r"[A-Z][a-zA-Z]*", site):
-        reasons.append(f"Site字段{site!r}应为拼音且每个单词首字母大写，如PanShiRoad")
-    if drone not in SESSION_FOLDER_DEVICES:
-        devices = "/".join(SESSION_FOLDER_DEVICES)
-        reasons.append(f"Drone字段{drone!r}不在设备白名单里，只认{devices}")
-    if not re.fullmatch(r"\d+m", height):
-        reasons.append(f"Height字段{height!r}应为数字+小写m，如200m")
-    if not re.fullmatch(r"[a-z]+", person):
-        reasons.append(f"Person字段{person!r}应全部小写，如wangziyu")
-    if not re.fullmatch(r"\d{8}", date):
-        reasons.append(f"Date字段{date!r}应为8位数字YYYYMMDD，如20260912")
-    return reasons or ["跟规范整体对不上，但逐字段检查没发现具体问题，可能是分隔符本身有问题"]
-
-
-def _looks_like_session_candidate(name: str) -> bool:
-    """名字里有没有出现过设备型号白名单里的词——用来判断这个文件夹"像"是在
-    想当会话文件夹、只是没完全写对(该报错拦下来)，还是纯粹的组织性目录
-    (该继续往下探索)。按"_"分段做整段匹配，不是子串匹配，避免误伤；大小写
-    不敏感——"Mini3pro"这种大小写写错的也该被拦下来报错，而不是因为没有
-    精确匹配上白名单就被当成无关目录静默放过。"""
-    return any(segment.lower() in _SESSION_FOLDER_DEVICES_LOWER for segment in name.split("_"))
-
-
-def _derive_category_folder(match: re.Match) -> str:
-    """从会话文件夹名解析出的城市+日期，算出本地落盘要用的分类文件夹名
-    (年份_城市_AerialVideos_季度)。这一层云端不存在，是我们本地自己拼的。"""
-    date = match.group("date")
-    year = date[:4]
-    quarter = (int(date[4:6]) - 1) // 3 + 1
-    return f"{year}_{match.group('city')}_AerialVideos_Q{quarter}"
 
 
 def free_space_gb(path: str | Path) -> float:
@@ -259,11 +203,11 @@ def _walk_session_folders(
                     "drive_id": drive_id,
                     "cloud_folder_id": file_id,
                     "cloud_folder_path": folder_path,
-                    "category_folder": _derive_category_folder(match),
+                    "category_folder": derive_category_folder(match),
                     "session_name": name,
                     "raw_files": raw_files,
                 })
-            elif _looks_like_session_candidate(name):
+            elif looks_like_session_candidate(name):
                 invalid_candidates.append({
                     "drive_id": drive_id,
                     "cloud_folder_id": file_id,
@@ -466,24 +410,31 @@ def _download_summary_line(downloaded: list[dict[str, Any]]) -> str:
 
 async def _report_invalid_session_name(session: AsyncSession, candidate: dict[str, Any]) -> None:
     """文件夹名命中了设备型号白名单、但整体格式没对上SESSION_FOLDER_RE——
-    只在第一次检测到时报警+记一条issue事件，避免同一个问题每6小时刷一次
-    飞书；人工把目录名改对之后，下次心跳会重新判定，不需要额外的"解除标记"
-    操作。这类文件夹不会被收集文件/不会进入心跳监控，是终态的拒绝。"""
+    报警+记一条issue事件；人工把目录名改对之后，下次心跳会重新判定，不需要
+    额外的"解除标记"操作。这类文件夹不会被收集文件/不会进入心跳监控，是
+    终态的拒绝。
+
+    去重判断依据是"这次的文件夹名"是不是跟上次报警时记录的名字完全一样——
+    不是"报没报过"。原来的版本只要报过一次就永久不再报，结果学生改名字
+    (哪怕改完还是不对，比如大小写没改对)之后系统完全没反应，第二次错误
+    被永久噤声了(2026-10-06发现此问题)。现在只有"名字没变、还是上次那个
+    错误"才跳过，名字只要变了(哪怕换了种错法)就要重新报一次。"""
     cloud_folder_id = candidate["cloud_folder_id"]
     folder_path = candidate["cloud_folder_path"]
-    already_flagged = await _latest_issue_event(session, cloud_folder_id, "invalid_session_name")
-    if already_flagged is not None:
+    name = candidate["name"]
+    last_event = await _latest_issue_event(session, cloud_folder_id, "invalid_session_name")
+    if last_event is not None and last_event.videos == [{"name": name}]:
         return
     # 逐字段诊断，精确到"哪个字段、写的是什么、应该长什么样"，不是笼统的
     # "不符合规范"——人一看报警就知道要去云端哪个文件夹改哪个字段
-    field_reasons = _diagnose_session_folder_name(candidate["name"])
+    field_reasons = diagnose_session_folder_name(name)
     reason = "；".join(field_reasons)
     session.add(AliyunSyncEvent(
         event_type="issue",
         issue_type="invalid_session_name",
         cloud_folder_id=cloud_folder_id,
         cloud_folder_path=folder_path,
-        videos=[],
+        videos=[{"name": name}],
         notified_at=datetime.now(timezone.utc),
     ))
     print(f"[aliyun] 命名不符合规范，拒绝下载：{folder_path}\n  {reason}", flush=True)
