@@ -13,7 +13,9 @@
 
 字段含义：
   city   采集地点城市，拼音，全部小写，如 beijing
-  site   地点名，拼音，全部小写，如 panshiroad
+  site   地点名，拼音(可带数字，比如路名带编号)，全部小写，如 panshiroad、
+         s3highway——2026-10-07发现原来写死只认字母会误杀带数字的地点名，
+         改成字母+数字
   drone  设备型号，固定白名单(SESSION_FOLDER_DEVICES)，全部小写，不在
          名单里的一律拒绝——宁可先报错拦下来，也不要静默收了一个拼错/
          没见过的机型名。Mavic3E统一写m3e(不是mavic3e)
@@ -32,7 +34,7 @@ from pathlib import Path
 
 SESSION_FOLDER_DEVICES = ("m3e", "air2s", "air3s", "mini4pro", "mini3pro")
 SESSION_FOLDER_RE = re.compile(
-    r"^(?P<city>[a-z]+)_(?P<site>[a-z]+)_"
+    r"^(?P<city>[a-z]+)_(?P<site>[a-z0-9]+)_"
     r"(?P<drone>" + "|".join(SESSION_FOLDER_DEVICES) + r")_"
     r"(?P<height>\d+)m_(?P<person>[a-z]+)_(?P<date>\d{8})$"
 )
@@ -57,8 +59,8 @@ def diagnose_session_folder_name(name: str) -> list[str]:
     reasons = []
     if not re.fullmatch(r"[a-z]+", city):
         reasons.append(f"city字段{city!r}应为拼音且全部小写，如beijing")
-    if not re.fullmatch(r"[a-z]+", site):
-        reasons.append(f"site字段{site!r}应为拼音且全部小写，如panshiroad")
+    if not re.fullmatch(r"[a-z0-9]+", site):
+        reasons.append(f"site字段{site!r}应为拼音(可带数字)且全部小写，如panshiroad/s3highway")
     if drone not in SESSION_FOLDER_DEVICES:
         devices = "/".join(SESSION_FOLDER_DEVICES)
         reasons.append(f"drone字段{drone!r}不在设备白名单里，只认{devices}(Mavic3E请写成m3e)")
