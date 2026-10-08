@@ -126,6 +126,18 @@ async def ensure_enough_space(path: str | Path, min_free_gb: float | None = None
     return False
 
 
+def _is_within_scan_roots(path: Path) -> bool:
+    """下载落地的目录是不是在AERIAL_SCAN_ROOTS配置的某一个根目录之下(或者
+    就是其中一个根目录本身)——只有在这个范围内才允许自动扫描进videos库，
+    见_trigger_download里的调用。"""
+    resolved = path.resolve()
+    for root in settings.scan_roots:
+        root_path = Path(root).resolve()
+        if resolved == root_path or resolved.is_relative_to(root_path):
+            return True
+    return False
+
+
 def _file_entry(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "file_id": str(item.get("file_id") or ""),
@@ -459,7 +471,7 @@ async def _trigger_download(
     all_succeeded = all(d.get("download_status") != "failed" for d in downloaded)
     _log_download_detail("文件夹判定上传完成，开始下载", folder_path, downloaded)
 
-    scanned_in = False
+    scanned_in = True  # 默认True：没必要扫/按策略跳过扫描，都不算"失败"
     if all_succeeded:
         # 全部文件下载成功后，才把这个文件夹扫描进videos库——跟scanner.py的
         # 常规定时扫盘复用同一套逻辑(哈希去重/瘦身检测/飞书通知都一样)，
@@ -467,12 +479,24 @@ async def _trigger_download(
         # 全量扫盘。scan失败也算这次没完成，不标记download_finished_at，
         # 下次心跳(云端内容没变、还在"稳定"状态)会自动整体重试
         local_folder = Path(settings.aliyun_download_dir).resolve() / folder["category_folder"] / folder["session_name"]
-        try:
-            await run_scan(session, str(local_folder))
-            scanned_in = True
-        except Exception as exc:  # noqa: BLE001  范围特意放宽：扫描入库这一步绝不能让整个扫描循环中断
-            print(f"[aliyun] 下载完成但扫描入库失败：{local_folder}  {exc}", flush=True)
-            await send_feishu_message(f"⚠️ 阿里云下载完成但扫描入库失败：{folder_path}\n{exc}")
+        if not _is_within_scan_roots(local_folder):
+            # 防火墙：aliyun_download_dir必须明确配在AERIAL_SCAN_ROOTS范围内，
+            # 才会自动扫描进videos库。2026-10-09发现：测试时download_dir临时
+            # 指向过SSD暂存目录(不在scan_roots内)，照样被扫进了正式的videos
+            # 表，污染了生产数据。以后download_dir指向任何不在scan_roots里的
+            # 地方(比如临时测试路径)，下载依然正常完成，但不会自动入库，
+            # 避免同样的事故重演
+            print(
+                f"[aliyun] 下载目录不在AERIAL_SCAN_ROOTS范围内，跳过扫描入库(不算失败)：{local_folder}",
+                flush=True,
+            )
+        else:
+            try:
+                await run_scan(session, str(local_folder))
+            except Exception as exc:  # noqa: BLE001  范围特意放宽：扫描入库这一步绝不能让整个扫描循环中断
+                scanned_in = False
+                print(f"[aliyun] 下载完成但扫描入库失败：{local_folder}  {exc}", flush=True)
+                await send_feishu_message(f"⚠️ 阿里云下载完成但扫描入库失败：{folder_path}\n{exc}")
     all_succeeded = all_succeeded and scanned_in
 
     session.add(AliyunSyncEvent(
