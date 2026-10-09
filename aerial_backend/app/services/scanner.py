@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Device, Notification, Operator, ScanDiscovery, ScanJob, Video
@@ -180,39 +181,54 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
                 replaces_sha256=old_active.sha256 if is_re_encode else None,
                 **new_fields,
             )
-            session.add(video)
-            # storage_path里如果能解析出"飞行会话文件夹"命名规范(见
-            # services/session_naming.py)，顺带补上device_id/collected_by；
-            # 解析不出来就保持原样(不是所有视频都来自这套命名规范)
-            await _apply_session_metadata(session, video, path)
-            await session.flush()  # 必须在这里flush，确保video先落库，
-            # 不然下面Notification.video_sha256(外键指向videos.sha256)可能
-            # 在同一次自动flush里insert顺序不对，报FK违反(见2026-09-07的事故)
-            files_new += 1
-            discovery.is_new_task = True
-
-            if is_re_encode:
-                # 旧记录软删除下线，不物理删除，历史数据还在；不发即时飞书通知，
-                # 走每日汇总(services/notifier.send_daily_summary)统计"今日更新了多少视频"。
-                # 汇总要等第二天9点才发、还按天切窗口，扫描当下看不出真实检测到几个，
-                # 所以这里直接打印，扫完数一下log就知道这次扫描实际检测到多少次瘦身更新
-                print(
-                    f"[scan] 检测到瘦身转码: {path}  "
-                    f"{old_active.sha256.hex()[:12]}... -> {digest.hex()[:12]}...",
-                    flush=True,
-                )
-                old_active.deleted_at = datetime.now(timezone.utc)
+            try:
+                # 用SAVEPOINT包住这个INSERT：aliyun下载完成后自动触发的run_scan
+                # 和每小时一次的scheduled_scan可能并发扫到同一批刚落地的文件，
+                # 两边都在session.get查到"不存在"之后抢着插入同一个sha256，
+                # 后提交的那边会在这里撞videos_pkey唯一键冲突。只回滚到
+                # SAVEPOINT(不影响这次扫描这之前已经flush/commit的其他文件)，
+                # 把这次冲突当成"内容已存在"处理，而不是让整个扫描任务崩掉
+                # (2026-10-09发现：炸出来的异常会让当前还没commit的这一批
+                # discovery/video/notification全部回滚)
+                async with session.begin_nested():
+                    session.add(video)
+                    # storage_path里如果能解析出"飞行会话文件夹"命名规范(见
+                    # services/session_naming.py)，顺带补上device_id/collected_by；
+                    # 解析不出来就保持原样(不是所有视频都来自这套命名规范)
+                    await _apply_session_metadata(session, video, path)
+                    await session.flush()  # 必须在这里flush，确保video先落库，
+                    # 不然下面Notification.video_sha256(外键指向videos.sha256)可能
+                    # 在同一次自动flush里insert顺序不对，报FK违反(见2026-09-07的事故)
+            except IntegrityError:
+                session.expunge(video)
+                files_duplicate += 1
+                discovery.is_new_task = False
             else:
-                # 真新增：insert videos 会触发DB里 trg_init_pipeline_status(若已建)，
-                # 自动为它生成8个阶段的pending状态行；触发器还没建时这一步只是单纯insert
-                session.add(
-                    Notification(
-                        video_sha256=digest,
-                        event_type="new_task",
-                        channel="feishu",
-                        payload={"file_path": str(path), "original_name": path.name},
+                files_new += 1
+                discovery.is_new_task = True
+
+                if is_re_encode:
+                    # 旧记录软删除下线，不物理删除，历史数据还在；不发即时飞书通知，
+                    # 走每日汇总(services/notifier.send_daily_summary)统计"今日更新了多少视频"。
+                    # 汇总要等第二天9点才发、还按天切窗口，扫描当下看不出真实检测到几个，
+                    # 所以这里直接打印，扫完数一下log就知道这次扫描实际检测到多少次瘦身更新
+                    print(
+                        f"[scan] 检测到瘦身转码: {path}  "
+                        f"{old_active.sha256.hex()[:12]}... -> {digest.hex()[:12]}...",
+                        flush=True,
                     )
-                )
+                    old_active.deleted_at = datetime.now(timezone.utc)
+                else:
+                    # 真新增：insert videos 会触发DB里 trg_init_pipeline_status(若已建)，
+                    # 自动为它生成8个阶段的pending状态行；触发器还没建时这一步只是单纯insert
+                    session.add(
+                        Notification(
+                            video_sha256=digest,
+                            event_type="new_task",
+                            channel="feishu",
+                            payload={"file_path": str(path), "original_name": path.name},
+                        )
+                    )
         else:
             files_duplicate += 1
             discovery.is_new_task = False
