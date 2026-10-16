@@ -22,6 +22,11 @@ from app.config import settings
 from app.models import Notification, Video
 
 MAX_RETRY = 5
+NOTIFY_DEBOUNCE_SECONDS = 600  # 同一文件夹最后一条pending通知的created_at距今不足10分钟，
+# 说明这个文件夹大概率还在被扫描任务陆续发现新文件(大文件夹会被扫盘按
+# COMMIT_BATCH_SIZE拆成好几个批次)，先不发，等这个文件夹静默够10分钟
+# 再合并成一条消息——避免一个大文件夹被拆成好几条"共50个视频"连续刷屏
+# (2026-10-16发现：一个265个视频的文件夹被拆成6条外观雷同的消息)
 
 
 def _format_message(n: Notification) -> str:
@@ -81,17 +86,34 @@ async def process_pending_notifications(session: AsyncSession, batch_size: int =
 
     new_task这类通知按"视频所在的直接父文件夹"分组合并成一条消息发送，
     避免一次扫盘发现一堆新视频时逐条刷屏；其他event_type照常逐条发送。
+
+    new_task分组还要过一道"静默期"：只有当某个文件夹最新一条pending通知
+    的created_at距今已经超过NOTIFY_DEBOUNCE_SECONDS，才把这个文件夹现存
+    的所有pending通知合并成一条发出去；否则说明扫盘可能还没扫完这个文件夹
+    (大文件夹会被COMMIT_BATCH_SIZE拆成好几批)，这一轮先跳过，等下一分钟
+    再看静默够了没。所以new_task这边不用batch_size限制查询范围——要看到
+    某个文件夹的全部pending才能判断"是不是还在涨"。
     """
-    result = await session.execute(
+    other_result = await session.execute(
         select(Notification)
         .where(Notification.status == "pending")
         .where(Notification.retry_count < MAX_RETRY)
+        .where(Notification.event_type != "new_task")
         .limit(batch_size)
     )
-    pending = result.scalars().all()
+    other_notifications = other_result.scalars().all()
+    for n in other_notifications:
+        text = _format_message(n)
+        ok = await send_feishu_message(text)
+        _mark_sent_or_retry(n, ok)
 
-    new_task_notifications = [n for n in pending if n.event_type == "new_task"]
-    other_notifications = [n for n in pending if n.event_type != "new_task"]
+    new_task_result = await session.execute(
+        select(Notification)
+        .where(Notification.status == "pending")
+        .where(Notification.retry_count < MAX_RETRY)
+        .where(Notification.event_type == "new_task")
+    )
+    new_task_notifications = new_task_result.scalars().all()
 
     groups: dict[str, list[Notification]] = defaultdict(list)
     for n in new_task_notifications:
@@ -99,19 +121,20 @@ async def process_pending_notifications(session: AsyncSession, batch_size: int =
         folder = str(Path(file_path).parent) if file_path else "(未知路径)"
         groups[folder].append(n)
 
+    now = datetime.now(timezone.utc)
+    sent_new_task_count = 0
     for folder, group in groups.items():
+        latest_created = max(n.created_at for n in group)
+        if (now - latest_created).total_seconds() < NOTIFY_DEBOUNCE_SECONDS:
+            continue
         text = f"🆕 新视频入库，请及时认领处理\n📁 {folder}\n共 {len(group)} 个视频"
         ok = await send_feishu_message(text)
         for n in group:
             _mark_sent_or_retry(n, ok)
-
-    for n in other_notifications:
-        text = _format_message(n)
-        ok = await send_feishu_message(text)
-        _mark_sent_or_retry(n, ok)
+        sent_new_task_count += len(group)
 
     await session.commit()
-    return len(pending)
+    return len(other_notifications) + sent_new_task_count
 
 
 async def send_daily_summary(session: AsyncSession) -> None:
