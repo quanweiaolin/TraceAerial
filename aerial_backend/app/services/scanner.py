@@ -200,7 +200,12 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
                     # 不然下面Notification.video_sha256(外键指向videos.sha256)可能
                     # 在同一次自动flush里insert顺序不对，报FK违反(见2026-09-07的事故)
             except IntegrityError:
-                session.expunge(video)
+                # begin_nested()的SAVEPOINT回滚会自动把这次失败insert的video
+                # 对象从session里摘掉，这里不需要(也不能)再手动expunge一次——
+                # 之前这行session.expunge(video)本身才是bug：对象已经不在
+                # session里了，再调用expunge会报InvalidRequestError("Instance
+                # ... is not present in this Session")，被aliyun_sync.py的
+                # 异常处理捕获，误报成"扫描入库失败"(2026-10-20生产端发现)
                 files_duplicate += 1
                 discovery.is_new_task = False
             else:
