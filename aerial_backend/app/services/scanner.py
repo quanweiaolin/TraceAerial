@@ -187,6 +187,15 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
             # 瘦身转码任务)覆盖了同一份文件，不是真新视频。videos.storage_path
             # 上有WHERE deleted_at IS NULL的唯一索引，旧记录不软删除的话下面
             # insert会直接报错。
+            #
+            # 注意：这个判定要求路径跟旧记录完全相等——如果瘦身的同时文件也被
+            # 挪了位置(新路径+新sha256)，这里会找不到old_active，不会被识别成
+            # 瘦身：旧记录永远不会下线，新文件被当成完全无关的新视频入库，丢失
+            # replaces_sha256血缘。这种"挪动+瘦身"同时发生的情况没法靠代码可靠
+            # 判断(文件名/大小这类特征去猜对应哪条旧记录是不可靠的启发式，猜错
+            # 比不关联更糟)，只能从操作流程上避免：要求两步分开做，先挪动(内容
+            # 不变，下面else分支会识别成"整体移动")，确认生效后再原地瘦身
+            # (2026-10-21达成一致，见README.md "videos表字段说明"那段)
             old_active_result = await session.execute(
                 select(Video)
                 .where(Video.storage_path == str(path))
