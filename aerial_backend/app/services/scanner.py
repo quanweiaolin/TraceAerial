@@ -12,7 +12,11 @@
            转码任务)，不是新视频 -> 旧记录deleted_at软删除下线，新记录
            replaces_sha256指回旧sha256，不发即时通知(走每日汇总统计)
      - 已存在 -> 只关联 resolved_video_sha256，is_new_task=False，不重复建任务
-       (同一内容换了路径/被复制，不应该产生第二条任务流)
+       (同一内容换了路径/被复制，不应该产生第二条任务流)；同时把该视频的
+       storage_path更新成这次扫到的新路径——如果一整个"飞行会话文件夹"
+       (含子目录)这次全部从旧位置挪到了新位置(旧文件夹下不再剩任何活着的
+       视频)，额外发一条folder_moved通知，只挪了部分文件的不够文件夹粒度，
+       不发(2026-10-21需求，见_folder_root/relocations)
   4. storage_path里如果能找到符合"飞行会话文件夹"命名规范的那一段(City_Site_
      Drone_Height_Person_Date，见services/session_naming.py)，顺带把
      device_id/collected_by补上——设备型号/人名在devices/operators表里找不到
@@ -22,10 +26,11 @@
 可以由 APScheduler 定时调用，也可以挂在 FastAPI 的 POST /scan/trigger 接口里异步跑。
 """
 import asyncio
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -64,6 +69,24 @@ async def _get_or_create_operator(session: AsyncSession, username: str) -> int:
     return operator.id
 
 
+def _folder_root(path_str: str) -> str:
+    """"文件夹"的定义：优先取路径里"飞行会话文件夹"命名规范那一段(含)为止的
+    前缀(比如.../2026_nanning_AerialVideos_Q3/nanning_xxx_20261020这一级)，
+    这样整个会话(连同它下面全部DJI_xxx子目录)被当成一个移动单位；路径不
+    符合这套命名规范(没有session_name这一段)的，退化成用它的直接父目录。
+    用于检测"整个文件夹被挪动位置"，见run_scan里的relocations。"""
+    path = Path(path_str)
+    match = find_session_match(path)
+    if match is None:
+        return str(path.parent)
+    session_name = match.group(0)
+    parts = path.parts
+    for i, part in enumerate(parts):
+        if part == session_name:
+            return str(Path(*parts[: i + 1]))
+    return str(path.parent)
+
+
 async def _apply_session_metadata(session: AsyncSession, video: Video, storage_path: Path) -> None:
     """从storage_path里找"飞行会话文件夹"命名规范的那一段(City_Site_Drone_
     Height_Person_Date)，补上device_id/collected_by。找不到就什么都不做——
@@ -97,6 +120,9 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
     await session.flush()  # 拿到job.id
 
     files_found = files_new = files_duplicate = 0
+    # (old_folder, new_folder) -> 这次扫描里从old_folder挪到new_folder的旧路径列表，
+    # 扫完整个root后统一检查old_folder是不是已经被挪空了(见循环结束后那段)
+    relocations: dict[tuple[str, str], list[str]] = defaultdict(list)
 
     for path in Path(root_path).rglob("*"):
         if not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS:
@@ -237,6 +263,20 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
         else:
             files_duplicate += 1
             discovery.is_new_task = False
+            old_path = existing.storage_path
+            if old_path != str(path):
+                # 同一份内容换了路径(文件夹被整体挪动/重命名，或者文件被复制
+                # 到了别的地方)——更新成当前真实路径，不然DB记录会永远停在
+                # 旧位置，以后每次扫到都会重新判定成"又换了一次路径"。同时
+                # 记下这次relocation，扫完整个root后统一检查：如果old_folder
+                # 下已经没有任何视频还指向它了(这次扫描把整个文件夹的内容都
+                # 挪完了)，才算"文件夹级别的整体移动"，发一条通知；只挪了
+                # 文件夹里一部分文件，没达到文件夹粒度，不报(2026-10-21需求)
+                existing.storage_path = str(path)
+                old_folder = _folder_root(old_path)
+                new_folder = _folder_root(str(path))
+                if old_folder != new_folder:
+                    relocations[(old_folder, new_folder)].append(old_path)
 
         discovery.resolved_video_sha256 = digest
 
@@ -249,6 +289,37 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
         if files_found % COMMIT_BATCH_SIZE == 0:
             await session.commit()
             print(f"[scan] committed at files_found={files_found}", flush=True)
+
+    if relocations:
+        # 只有old_folder下已经一个活着的视频都不剩(这次扫描把它见到的全部
+        # 内容都挪去了new_folder)，才算达到"文件夹"粒度——只挪了一部分文件
+        # 的，old_folder下还会剩下别的视频，remaining>0，不报
+        await session.flush()
+        for (old_folder, new_folder), old_paths in relocations.items():
+            remaining_result = await session.execute(
+                select(func.count())
+                .select_from(Video)
+                .where(Video.storage_path.like(f"{old_folder}/%"))
+                .where(Video.deleted_at.is_(None))
+            )
+            if remaining_result.scalar_one() == 0:
+                file_count = len(old_paths)
+                print(
+                    f"[scan] 检测到文件夹整体移动: {old_folder} -> {new_folder}，"
+                    f"共{file_count}个文件",
+                    flush=True,
+                )
+                session.add(
+                    Notification(
+                        event_type="folder_moved",
+                        channel="feishu",
+                        payload={
+                            "old_folder": old_folder,
+                            "new_folder": new_folder,
+                            "file_count": file_count,
+                        },
+                    )
+                )
 
     job.files_found = files_found
     job.files_new = files_new
