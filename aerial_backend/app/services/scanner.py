@@ -123,6 +123,9 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
     # (old_folder, new_folder) -> 这次扫描里从old_folder挪到new_folder的旧路径列表，
     # 扫完整个root后统一检查old_folder是不是已经被挪空了(见循环结束后那段)
     relocations: dict[tuple[str, str], list[str]] = defaultdict(list)
+    # (old_folder, new_folder) -> 两边都真实存在、内容重复的新路径列表，
+    # 扫完整个root后统一报一次(且只报一次，见循环结束后那段)
+    duplicates: dict[tuple[str, str], list[str]] = defaultdict(list)
 
     for path in Path(root_path).rglob("*"):
         if not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS:
@@ -274,18 +277,27 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
             discovery.is_new_task = False
             old_path = existing.storage_path
             if old_path != str(path):
-                # 同一份内容换了路径(文件夹被整体挪动/重命名，或者文件被复制
-                # 到了别的地方)——更新成当前真实路径，不然DB记录会永远停在
-                # 旧位置，以后每次扫到都会重新判定成"又换了一次路径"。同时
-                # 记下这次relocation，扫完整个root后统一检查：如果old_folder
-                # 下已经没有任何视频还指向它了(这次扫描把整个文件夹的内容都
-                # 挪完了)，才算"文件夹级别的整体移动"，发一条通知；只挪了
-                # 文件夹里一部分文件，没达到文件夹粒度，不报(2026-10-21需求)
-                existing.storage_path = str(path)
+                # 同一份内容换了路径——但"换了路径"有两种真实情况，必须先
+                # 查一下DB里记录的旧路径磁盘上是否还真的有文件，才能分清楚：
+                #   - 旧路径磁盘上已经不在了 -> 真的被挪动/重命名了 -> 更新
+                #     storage_path，按文件夹粒度记relocation候选(见下面)
+                #   - 旧路径磁盘上还在 -> 不是挪动，是两边各有一份实打实的
+                #     重复文件 -> storage_path保持冻结不动(不要跟着这次扫到
+                #     的路径乱跳，不然下次扫到另一边又会跳回去，来回刷)，
+                #     按文件夹粒度记duplicate候选，只报一次(2026-10-22改：
+                #     之前不管三七二十一都更新storage_path，两份都真实存在
+                #     时会导致每次扫描都在两个路径间来回标记"挪动"，见
+                #     2026-10-21晚上nanning/shanghai那几个文件夹反复刷飞书
+                #     通知的事故)
                 old_folder = _folder_root(old_path)
                 new_folder = _folder_root(str(path))
-                if old_folder != new_folder:
-                    relocations[(old_folder, new_folder)].append(old_path)
+                if Path(old_path).exists():
+                    if old_folder != new_folder:
+                        duplicates[(old_folder, new_folder)].append(str(path))
+                else:
+                    existing.storage_path = str(path)
+                    if old_folder != new_folder:
+                        relocations[(old_folder, new_folder)].append(old_path)
 
         discovery.resolved_video_sha256 = digest
 
@@ -329,6 +341,40 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
                         },
                     )
                 )
+
+    if duplicates:
+        # storage_path已经冻结不动，所以同一对(old_folder, new_folder)以后
+        # 每次扫描都会重新判定成"重复"——只在还没为这一对发过通知时才发，
+        # 不然会跟改之前的flapping问题一样变成每小时刷一次。等人工清理掉
+        # 其中一份、磁盘上old_path真的不存在了，下次扫描会自然判定成"真·
+        # 挪动"(走上面relocations那条路)，不再落到这里
+        for (old_folder, new_folder), new_paths in duplicates.items():
+            already_notified_result = await session.execute(
+                select(func.count())
+                .select_from(Notification)
+                .where(Notification.event_type == "folder_duplicate")
+                .where(Notification.payload["old_folder"].astext == old_folder)
+                .where(Notification.payload["new_folder"].astext == new_folder)
+            )
+            if already_notified_result.scalar_one() > 0:
+                continue
+            file_count = len(new_paths)
+            print(
+                f"[scan] 检测到文件夹磁盘重复(两边都有文件，storage_path冻结不变): "
+                f"{old_folder} <-> {new_folder}，共{file_count}个文件",
+                flush=True,
+            )
+            session.add(
+                Notification(
+                    event_type="folder_duplicate",
+                    channel="feishu",
+                    payload={
+                        "old_folder": old_folder,
+                        "new_folder": new_folder,
+                        "file_count": file_count,
+                    },
+                )
+            )
 
     job.files_found = files_found
     job.files_new = files_new
