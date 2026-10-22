@@ -24,13 +24,24 @@
      合并即可)，匹配不到(路径不符合这个命名规范)就保持原样不处理
 
 可以由 APScheduler 定时调用，也可以挂在 FastAPI 的 POST /scan/trigger 接口里异步跑。
+
+------------------------------------------------------------------
+【跨程序集成】其他连同一个Postgres实例的程序(比如拿Claude API跑整图
+environment标注那个)，不用轮询，直接在自己的连接上执行一次
+`LISTEN aerial_new_video;`，就能实时收到每一条真新视频的推送——payload是
+一个JSON字符串，形如 {"sha256": "<64位hex>", "storage_path": "<绝对路径>"}。
+用的是Postgres原生的NOTIFY/LISTEN，跟着事务走(本函数这边commit了才真的
+发出去，SAVEPOINT因并发冲突回滚的那次不会误发)，不需要额外加HTTP接口/
+消息队列(2026-10-22达成一致)。
+------------------------------------------------------------------
 """
 import asyncio
+import json
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -41,6 +52,7 @@ from app.services.video_metadata import extract_new_video_fields
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
 COMMIT_BATCH_SIZE = 100  # 每处理这么多个文件落库一次，避免大目录跑到一半被杀/OOM全部白扫
+NEW_VIDEO_NOTIFY_CHANNEL = "aerial_new_video"  # 跨程序LISTEN用的channel名，见上面模块docstring
 
 
 async def _get_or_create_device(session: AsyncSession, model: str) -> int:
@@ -271,6 +283,19 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
                             channel="feishu",
                             payload={"file_path": str(path), "original_name": path.name},
                         )
+                    )
+                    # 同时给跨程序的LISTEN订阅者推一条(见模块docstring"跨程序集成")，
+                    # 每个真新视频一条，不像飞书那样按文件夹合并——订阅方是逐个视频
+                    # 触发Claude API标注的，需要精确到单个视频粒度
+                    await session.execute(
+                        text("SELECT pg_notify(:channel, :payload)"),
+                        {
+                            "channel": NEW_VIDEO_NOTIFY_CHANNEL,
+                            "payload": json.dumps({
+                                "sha256": digest.hex(),
+                                "storage_path": str(path),
+                            }),
+                        },
                     )
         else:
             files_duplicate += 1
