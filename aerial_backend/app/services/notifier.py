@@ -1,14 +1,32 @@
 """
-飞书通知服务。
+飞书通知服务，兼跨程序的Postgres NOTIFY推送。
 
 设计成"队列消费者"模式而不是"事件发生时同步调用"：
   - 各处业务逻辑(扫盘/校验失败/阶段完成)只管往 notifications 表插一条 pending 记录
   - 一个独立的后台worker(process_pending_notifications)定时轮询、批量发送
 优点：飞书接口抖动/限流不会拖慢主业务请求；失败了下一轮还会重试。
+
+------------------------------------------------------------------
+【跨程序集成】其他连同一个Postgres实例的程序(比如拿Claude API跑整图
+environment标注那个)，不用轮询，在自己的连接上执行一次
+`LISTEN aerial_new_folder_video_names;`，就能实时收到新视频的推送。粒度是
+文件夹：payload是JSON字符串，形如
+{"folder": "<文件夹绝对路径>", "video_names": ["a.MP4", "b.MP4", ...]}。
+跟飞书new_task走的是同一套"静默期"debounce(见NOTIFY_DEBOUNCE_SECONDS)——
+不是扫盘一发现新视频就立刻推送，而是等这个文件夹静默够10分钟(大概率
+已经扫完/上传完了，不会再有更多文件陆续进来)才一次性推送这期间新增的
+文件名，避免像阿里云下载那边的"稳定期"判断一样太快反应导致推送太频繁
+(2026-10-22达成一致：类比阿里云同步的stability_scans等待机制)。同一个
+文件夹以后又有新视频静默期满了，会再推一条新的payload，只含那次新增的
+文件名，不是历史累计的全部。单个文件夹一次性到几百个视频很常见(实测见过
+279个)，payload超过Postgres 8000字节上限时会自动按video_names切成多条
+NOTIFY(folder相同)，不会报错(见_chunk_video_names)。
+------------------------------------------------------------------
 """
 import base64
 import hashlib
 import hmac
+import json
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -26,7 +44,31 @@ NOTIFY_DEBOUNCE_SECONDS = 600  # 同一文件夹最后一条pending通知的crea
 # 说明这个文件夹大概率还在被扫描任务陆续发现新文件(大文件夹会被扫盘按
 # COMMIT_BATCH_SIZE拆成好几个批次)，先不发，等这个文件夹静默够10分钟
 # 再合并成一条消息——避免一个大文件夹被拆成好几条"共50个视频"连续刷屏
-# (2026-10-16发现：一个265个视频的文件夹被拆成6条外观雷同的消息)
+# (2026-10-16发现：一个265个视频的文件夹被拆成6条外观雷同的消息)。
+# 跨程序的pg_notify推送复用同一个debounce窗口，道理一样：等这批大概率
+# 已经传完了再通知下游去跑Claude API，不要它还在陆续上传就频繁触发。
+NEW_VIDEO_NOTIFY_CHANNEL = "aerial_new_folder_video_names"  # 跨程序LISTEN用的channel名，见上面模块docstring
+NOTIFY_PAYLOAD_MAX_BYTES = 7800  # 留点余量，Postgres NOTIFY payload硬上限是8000字节
+
+
+def _chunk_video_names(folder: str, names: list[str], max_bytes: int = NOTIFY_PAYLOAD_MAX_BYTES) -> list[list[str]]:
+    """把一个文件夹里新增的视频文件名列表切成若干块，保证每块序列化成
+    {"folder": folder, "video_names": [...]}这个JSON之后不超过max_bytes字节——
+    单个文件夹一次性到几百个视频很常见(实测见过279个)，不切的话payload肯定
+    超过Postgres NOTIFY的8000字节硬上限，直接报错。"""
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    for name in names:
+        candidate = current + [name]
+        payload_size = len(json.dumps({"folder": folder, "video_names": candidate}).encode("utf-8"))
+        if current and payload_size > max_bytes:
+            chunks.append(current)
+            current = [name]
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def _format_message(n: Notification) -> str:
@@ -105,8 +147,8 @@ async def process_pending_notifications(session: AsyncSession, batch_size: int =
     )
     other_notifications = other_result.scalars().all()
     for n in other_notifications:
-        text = _format_message(n)
-        ok = await send_feishu_message(text)
+        message_text = _format_message(n)
+        ok = await send_feishu_message(message_text)
         _mark_sent_or_retry(n, ok)
 
     new_task_result = await session.execute(
@@ -129,11 +171,30 @@ async def process_pending_notifications(session: AsyncSession, batch_size: int =
         latest_created = max(n.created_at for n in group)
         if (now - latest_created).total_seconds() < NOTIFY_DEBOUNCE_SECONDS:
             continue
-        text = f"🆕 新视频入库，请及时认领处理\n📁 {folder}\n共 {len(group)} 个视频"
-        ok = await send_feishu_message(text)
+        message_text = f"🆕 新视频入库，请及时认领处理\n📁 {folder}\n共 {len(group)} 个视频"
+        ok = await send_feishu_message(message_text)
         for n in group:
             _mark_sent_or_retry(n, ok)
         sent_new_task_count += len(group)
+
+        # 跟飞书用同一个debounce判断(这个文件夹静默够了)，顺带给跨程序的
+        # LISTEN订阅者推一次(见模块docstring"跨程序集成")——不管飞书那条
+        # 发没发成功都推，这个通道不走飞书的重试机制，NOTIFY本身就是
+        # at-most-once、下游要自己保证幂等(存不存在sha256对应的标注结果)
+        video_names = [
+            n.payload.get("original_name")
+            for n in group
+            if n.payload and n.payload.get("original_name")
+        ]
+        if video_names:
+            for chunk in _chunk_video_names(folder, video_names):
+                await session.execute(
+                    text("SELECT pg_notify(:channel, :payload)"),
+                    {
+                        "channel": NEW_VIDEO_NOTIFY_CHANNEL,
+                        "payload": json.dumps({"folder": folder, "video_names": chunk}),
+                    },
+                )
 
     await session.commit()
     return len(other_notifications) + sent_new_task_count
