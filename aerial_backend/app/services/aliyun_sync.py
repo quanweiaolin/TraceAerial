@@ -43,6 +43,7 @@ import os
 import secrets
 import shutil
 import sys
+import time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -289,6 +290,33 @@ async def _last_known_files(session: AsyncSession, cloud_folder_id: str) -> list
     return row.files if row is not None else None
 
 
+def _cleanup_stale_download_temp_files(directory: Path) -> None:
+    """清理底层aliyun CLI自己内部下载机制留下的.pds-download-*残留文件——
+    这个命名不是我们自己代码起的(搜过pds_sync源码里没有这个约定)，是aliyun
+    CLI那个二进制自己内部download-to-local时用的临时文件机制；下载子进程被
+    kill/超时中断时会在目标目录留下这类孤儿文件，我们自己的_download_one_file
+    完全不知道它的存在、也不会去清理(只会清理自己起名的.{name}.{hex}.part)。
+    只清理修改时间早于aliyun_download_timeout_seconds的——Python
+    subprocess.run(timeout=...)超时会真的kill掉子进程(标准库保证)，所以
+    超过这个时长还在的，一定不会再有别的下载还在写它，可以放心删，不会跟
+    正在进行中的下载撞车(2026-10-22发现：5个这样的孤儿文件，最早的是10-7
+    留下的，合计浪费小几十G磁盘空间，一直没人清)。"""
+    cutoff = time.time() - settings.aliyun_download_timeout_seconds
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.name.startswith(".pds-download-"):
+            continue
+        try:
+            if entry.is_file() and entry.stat().st_mtime < cutoff:
+                entry.unlink()
+                print(f"[aliyun] 清理掉过期的下载残留文件: {entry}", flush=True)
+        except OSError:
+            continue
+
+
 def _download_one_file(
     cli: PdsCli, local_relative_path: str, raw_item: dict[str, Any], download_root: Path
 ) -> dict[str, Any]:
@@ -307,6 +335,7 @@ def _download_one_file(
     if not target.is_relative_to(root):
         raise ValueError(f"本地相对路径逃出了下载目录: {local_relative_path}")
     target.parent.mkdir(parents=True, exist_ok=True)
+    _cleanup_stale_download_temp_files(target.parent)
 
     status = "downloaded"
     if target.exists():
@@ -392,6 +421,46 @@ async def _download_folder_files(folder: dict[str, Any], cli: PdsCli) -> list[di
     return downloaded
 
 
+RECONCILE_MAX_ATTEMPTS = 3  # 文件数核对不上时最多重试几次，见_download_with_reconciliation
+
+
+def _count_local_files(folder: dict[str, Any], download_root: Path) -> int:
+    """数一下这个会话文件夹现在磁盘上实际有多少个文件(递归，排除以"."开头的——
+    我们自己的.{name}.{hex}.part临时文件、底层CLI的.pds-download-*残留、
+    .DS_Store这类系统文件都不算)，用来跟云端这次心跳报的文件数核对。"""
+    target_dir = download_root / folder["category_folder"] / folder["session_name"]
+    if not target_dir.is_dir():
+        return 0
+    return sum(1 for p in target_dir.rglob("*") if p.is_file() and not p.name.startswith("."))
+
+
+async def _download_with_reconciliation(
+    folder: dict[str, Any], cli: PdsCli
+) -> tuple[list[dict[str, Any]], bool]:
+    """下载这个文件夹的全部当前文件，下载完之后额外核对一次"云端这次心跳报的
+    文件数 vs 本地实际落盘的文件数"——每个文件下载异常_download_one_file自己
+    能感知(见_download_folder_files里的try/except)，但"这次调用里没有一个
+    文件报异常"不等于"数出来的文件总数真的对得上"，这个核对是多一道保险。
+    对不上就重试(最多RECONCILE_MAX_ATTEMPTS次，每次都是完整重跑
+    _download_folder_files——已经下载对的文件靠哈希跳过，不会重复下载，
+    只会真正重试还缺的那些，代价很小)，重试次数用完还是对不上，返回
+    reconciled=False，调用方负责报警，不在这里发消息(2026-10-22达成一致：
+    对不上先重试，3次不行再报警)。"""
+    expected_count = len(folder["raw_files"])
+    downloaded: list[dict[str, Any]] = []
+    for attempt in range(1, RECONCILE_MAX_ATTEMPTS + 1):
+        downloaded = await _download_folder_files(folder, cli)
+        actual_count = _count_local_files(folder, Path(settings.aliyun_download_dir))
+        if actual_count == expected_count:
+            return downloaded, True
+        print(
+            f"[aliyun] 文件数核对不上(第{attempt}/{RECONCILE_MAX_ATTEMPTS}次)："
+            f"云端{expected_count}个，本地实际{actual_count}个，{folder['cloud_folder_path']}",
+            flush=True,
+        )
+    return downloaded, False
+
+
 def _log_download_detail(context: str, folder_path: str, downloaded: list[dict[str, Any]]) -> None:
     """log里给"这次下载具体怎么样"用的详细版本，比飞书消息内容更全——每个
     文件的下载结果(状态/本地路径/失败原因)都列出来。只在真的触发下载动作
@@ -466,9 +535,9 @@ async def _trigger_download(
         return  # 磁盘不够，飞书已经发过了，等下次心跳再试
 
     download_started_at = datetime.now(timezone.utc)
-    downloaded = await _download_folder_files(folder, cli)
+    downloaded, reconciled = await _download_with_reconciliation(folder, cli)
     download_finished_at = datetime.now(timezone.utc)
-    all_succeeded = all(d.get("download_status") != "failed" for d in downloaded)
+    all_succeeded = all(d.get("download_status") != "failed" for d in downloaded) and reconciled
     _log_download_detail("文件夹判定上传完成，开始下载", folder_path, downloaded)
 
     scanned_in = True  # 默认True：没必要扫/按策略跳过扫描，都不算"失败"
@@ -518,6 +587,15 @@ async def _trigger_download(
         await send_feishu_message(
             f"✅ 阿里云文件夹下载完成并已扫描入库：{folder_path}\n{_download_summary_line(downloaded)}"
         )
+    elif not reconciled:
+        # 跟"处理未全部成功"分开报——那条是单个文件下载/扫描报了异常，这条是
+        # 没有任何异常、但重试RECONCILE_MAX_ATTEMPTS次之后文件数还是对不上，
+        # 更可能是真实数据缺失，需要人工确认，不是"下次心跳自动重试"就能
+        # 解决的(2026-10-22达成一致)
+        await send_feishu_message(
+            f"🚨 阿里云文件夹下载后文件数核对不上(已重试{RECONCILE_MAX_ATTEMPTS}次)，"
+            f"请人工确认：{folder_path}\n{_download_summary_line(downloaded)}"
+        )
     else:
         await send_feishu_message(
             f"⚠️ 阿里云文件夹处理未全部成功，下次心跳会自动重试：{folder_path}\n{_download_summary_line(downloaded)}"
@@ -532,7 +610,7 @@ async def _handle_reupload(
         return  # 磁盘不够，飞书已经发过了，等下次心跳再试
 
     download_started_at = datetime.now(timezone.utc)
-    downloaded = await _download_folder_files(folder, cli)
+    downloaded, reconciled = await _download_with_reconciliation(folder, cli)
     download_finished_at = datetime.now(timezone.utc)
     _log_download_detail("完成后又有新上传，继续下载", folder_path, downloaded)
 
@@ -549,6 +627,14 @@ async def _handle_reupload(
     await send_feishu_message(
         f"⚠️ 已判定完成的文件夹又有新上传：{folder_path}\n{_download_summary_line(downloaded)}"
     )
+    if not reconciled:
+        # 同_trigger_download那边的道理：重试RECONCILE_MAX_ATTEMPTS次后文件数
+        # 还是对不上，单独报一条，别混在上面那条"又有新上传"里不显眼
+        # (2026-10-22达成一致)
+        await send_feishu_message(
+            f"🚨 阿里云文件夹下载后文件数核对不上(已重试{RECONCILE_MAX_ATTEMPTS}次)，"
+            f"请人工确认：{folder_path}\n{_download_summary_line(downloaded)}"
+        )
 
 
 async def _handle_possible_deletion(
