@@ -28,8 +28,15 @@
 ------------------------------------------------------------------
 【跨程序集成】其他连同一个Postgres实例的程序(比如拿Claude API跑整图
 environment标注那个)，不用轮询，直接在自己的连接上执行一次
-`LISTEN aerial_new_video;`，就能实时收到每一条真新视频的推送——payload是
-一个JSON字符串，形如 {"sha256": "<64位hex>", "storage_path": "<绝对路径>"}。
+`LISTEN aerial_new_folder_video_names;`，就能实时收到新视频的推送。粒度是
+文件夹：这次扫描在同一个文件夹(storage_path的直接父目录)下发现了几个真新
+视频，就在这个文件夹对应的payload里列出这几个视频的文件名，不是逐个视频
+单独推一条。同一个文件夹如果后续(比如下一次扫描)又有新视频上传进来，会
+再推一条新的payload，里面只有这次新增的文件名(不是历史累计的全部)——
+下游各自攒着拼就行。payload是JSON字符串，形如
+{"folder": "<文件夹绝对路径>", "video_names": ["a.MP4", "b.MP4", ...]}；
+单个文件夹一次性到几百个视频很常见，payload超过Postgres 8000字节上限时
+会自动按video_names切成多条NOTIFY(folder相同)，不会报错(见_chunk_video_names)。
 用的是Postgres原生的NOTIFY/LISTEN，跟着事务走(本函数这边commit了才真的
 发出去，SAVEPOINT因并发冲突回滚的那次不会误发)，不需要额外加HTTP接口/
 消息队列(2026-10-22达成一致)。
@@ -52,7 +59,28 @@ from app.services.video_metadata import extract_new_video_fields
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
 COMMIT_BATCH_SIZE = 100  # 每处理这么多个文件落库一次，避免大目录跑到一半被杀/OOM全部白扫
-NEW_VIDEO_NOTIFY_CHANNEL = "aerial_new_video"  # 跨程序LISTEN用的channel名，见上面模块docstring
+NEW_VIDEO_NOTIFY_CHANNEL = "aerial_new_folder_video_names"  # 跨程序LISTEN用的channel名，见上面模块docstring
+NOTIFY_PAYLOAD_MAX_BYTES = 7800  # 留点余量，Postgres NOTIFY payload硬上限是8000字节
+
+
+def _chunk_video_names(folder: str, names: list[str], max_bytes: int = NOTIFY_PAYLOAD_MAX_BYTES) -> list[list[str]]:
+    """把一个文件夹里新发现的视频文件名列表切成若干块，保证每块序列化成
+    {"folder": folder, "video_names": [...]}这个JSON之后不超过max_bytes字节——
+    单个文件夹一次性到几百个视频很常见(实测见过279个)，不切的话payload肯定
+    超过Postgres NOTIFY的8000字节硬上限，直接报错。"""
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    for name in names:
+        candidate = current + [name]
+        payload_size = len(json.dumps({"folder": folder, "video_names": candidate}).encode("utf-8"))
+        if current and payload_size > max_bytes:
+            chunks.append(current)
+            current = [name]
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 async def _get_or_create_device(session: AsyncSession, model: str) -> int:
@@ -138,6 +166,9 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
     # (old_folder, new_folder) -> 两边都真实存在、内容重复的新路径列表，
     # 扫完整个root后统一报一次(且只报一次，见循环结束后那段)
     duplicates: dict[tuple[str, str], list[str]] = defaultdict(list)
+    # 文件夹绝对路径 -> 这次扫描在这个文件夹里新发现的视频文件名列表，
+    # 扫完整个root后按文件夹统一给跨程序LISTEN订阅者推一次(见模块docstring)
+    new_videos_by_folder: dict[str, list[str]] = defaultdict(list)
 
     for path in Path(root_path).rglob("*"):
         if not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS:
@@ -284,19 +315,9 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
                             payload={"file_path": str(path), "original_name": path.name},
                         )
                     )
-                    # 同时给跨程序的LISTEN订阅者推一条(见模块docstring"跨程序集成")，
-                    # 每个真新视频一条，不像飞书那样按文件夹合并——订阅方是逐个视频
-                    # 触发Claude API标注的，需要精确到单个视频粒度
-                    await session.execute(
-                        text("SELECT pg_notify(:channel, :payload)"),
-                        {
-                            "channel": NEW_VIDEO_NOTIFY_CHANNEL,
-                            "payload": json.dumps({
-                                "sha256": digest.hex(),
-                                "storage_path": str(path),
-                            }),
-                        },
-                    )
+                    # 记一下，扫完整个root后按文件夹统一给跨程序LISTEN订阅者
+                    # 推一次(见模块docstring"跨程序集成")
+                    new_videos_by_folder[str(path.parent)].append(path.name)
         else:
             files_duplicate += 1
             discovery.is_new_task = False
@@ -399,6 +420,16 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
                         "file_count": file_count,
                     },
                 )
+            )
+
+    for folder, names in new_videos_by_folder.items():
+        for chunk in _chunk_video_names(folder, names):
+            await session.execute(
+                text("SELECT pg_notify(:channel, :payload)"),
+                {
+                    "channel": NEW_VIDEO_NOTIFY_CHANNEL,
+                    "payload": json.dumps({"folder": folder, "video_names": chunk}),
+                },
             )
 
     job.files_found = files_found
