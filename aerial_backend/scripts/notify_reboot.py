@@ -41,7 +41,8 @@ async def main() -> None:
     mounted = _wait_for_mount()
     status = "已自动挂载" if mounted else "⚠️ 挂载失败，需要人工检查"
     await send_feishu_message(
-        f"🔄 服务器重启了\n{MOUNT_POINT} 共享盘：{status}\naerial_backend服务需要手动git pull + 重启"
+        f"🔄 服务器重启了\n{MOUNT_POINT} 共享盘：{status}\n"
+        f"阿里云自动下载以及其他数据库任务暂停，aerial_backend服务现在需要手动重启"
     )
 
 
