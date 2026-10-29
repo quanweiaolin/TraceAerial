@@ -35,9 +35,12 @@ SESSION_FOLDER_RE，例如 changchun_panshiroad_m3e_200m_wangziyu_20260912)，
      - 云端没变(这是大多数心跳的情况) → 额外检查一下本地磁盘上这些文件
        是否还真的在(2026-10-29真实事故：本地整理文件夹时把36个MP4弄丢了，
        云端这边完全没变，之前的逻辑在这里直接return，完全没有机会发现本地
-       少了东西)。本地缺了就重新触发一次下载(复用_download_with_
-       reconciliation，已经存在且内容对的文件会被底层_file_matches按哈希
-       跳过，只会真正传输缺的那部分) + 写issue事件(local_files_missing)
+       少了东西)。本地缺了只报警(飞书+log) + 写issue事件
+       (local_files_missing)，不自动重新下载——"修复本地磁盘完整性"不是
+       这个"同步云端新内容"模块该管的事，而且这个检测可能被NAS挂载短暂
+       抖动误触发，自动下载的话一次误判就是一次大规模重新下载风暴，交给
+       人判断更安全(2026-10-29跟用户讨论后收窄范围，见_handle_local_files_
+       missing注释)
 
 不做的事(明确暂缓，见项目里的讨论记录)：
   - unknown_uploader检测(飞手归属要靠按人分文件夹的真实结构，测试数据还没有)
@@ -727,7 +730,7 @@ async def _handle_possible_deletion(
 
 
 async def _handle_local_files_missing(
-    session: AsyncSession, cli: PdsCli, folder: dict[str, Any], missing: list[dict[str, Any]]
+    session: AsyncSession, folder: dict[str, Any], missing: list[dict[str, Any]]
 ) -> None:
     """已经判定完成下载的文件夹，云端这次心跳跟上次比完全没变，但本地磁盘
     上该有的文件却不见了(2026-10-29真实事故：有人整理文件夹时把一个session
@@ -735,68 +738,33 @@ async def _handle_local_files_missing(
     这次跟上次的大小/文件数，云端没变就直接return，从来没有机会检查本地
     磁盘的实际情况——这个函数就是补这个缺口的。
 
-    直接对整个文件夹重跑一次_download_with_reconciliation，不是只下载
-    missing这几个：已经存在且内容对得上的文件会被底层_file_matches按哈希
-    自动跳过(比较本地文件内容跟云端content_hash，跟我们videos表的sha1列
-    完全无关)，所以重跑一次只会真正传输缺失的部分，代价可控，逻辑也更
-    简单(不用维护"只下载这个子集"的另一套路径拼接代码)。
-
-    重新扫描进videos库这一步：这些视频的sha256早就在库里(当年第一次下载
-    时就入库了，只是物理文件后来不见了)，scanner.py按sha256识别出"已存在"，
-    不会产生重复记录，只是物理文件补回来了。sha1列还会是NULL——backfill_
-    video_sha1.py下次跑的时候文件已经在了，自然会补上，这里不用管。"""
+    只报警(飞书+log+写issue事件)，不自动重新下载：这个检测本身可能被NAS
+    挂载短暂抖动误触发(挂载点一瞬间访问不到，is_file()对一大批文件夹同时
+    返回False，看起来像"全丢了"但其实什么都没丢)，自动下载的话一次误判
+    就会引发大规模重新下载风暴，浪费带宽、刷屏飞书；而且"修复本地磁盘
+    完整性"本来就不该是"同步云端新内容"这个模块的职责——发现问题，交给
+    人判断是真丢了还是误判、要不要修，这个模块到此为止(2026-10-29跟用户
+    讨论后收窄范围)。"""
     folder_path = folder["cloud_folder_path"]
     missing_names = [m.get("relative_path") or m.get("name") for m in missing]
     print(
-        f"[aliyun] 已完成的文件夹本地文件丢失(云端未变)，重新下载：{folder_path}，"
+        f"[aliyun] 已完成的文件夹本地文件丢失(云端未变)：{folder_path}，"
         f"缺失{len(missing)}个: {missing_names}",
         flush=True,
     )
-    await send_feishu_message(
-        f"{PREFIX_ALIYUN} 🚨 已判定完成的文件夹本地磁盘文件丢失(云端完好)，正在重新下载："
-        f"{folder_path}\n缺失{len(missing)}个文件: " + "、".join(str(n) for n in missing_names[:10])
-        + ("等" if len(missing_names) > 10 else "")
-    )
-
-    if not await ensure_enough_space(settings.aliyun_download_dir):
-        return  # 磁盘不够，飞书已经发过了，等下次心跳再试
-
-    download_started_at = datetime.now(timezone.utc)
-    downloaded, reconciled = await _download_with_reconciliation(folder, cli)
-    download_finished_at = datetime.now(timezone.utc)
-    _log_download_detail("本地文件丢失，重新下载", folder_path, downloaded)
-
-    scanned_in = True
-    if reconciled:
-        local_folder = Path(settings.aliyun_download_dir).resolve() / folder["category_folder"] / folder["session_name"]
-        if _is_within_scan_roots(local_folder):
-            try:
-                await run_scan(session, str(local_folder))
-            except Exception as exc:  # noqa: BLE001  扫描入库这一步绝不能让整个扫描循环中断
-                scanned_in = False
-                print(f"[aliyun] 本地文件补回后扫描入库失败：{local_folder}  {exc}", flush=True)
-                await send_feishu_message(f"{PREFIX_ALIYUN} ⚠️ 本地文件补回后扫描入库失败：{folder_path}\n{exc}")
-
     session.add(AliyunSyncEvent(
         event_type="issue",
         issue_type="local_files_missing",
         cloud_folder_id=folder["cloud_folder_id"],
         cloud_folder_path=folder_path,
-        videos=downloaded,
-        download_started_at=download_started_at,
-        download_finished_at=download_finished_at if reconciled and scanned_in else None,
+        videos=[{"name": n} for n in missing_names],
         notified_at=datetime.now(timezone.utc),
     ))
-
-    if reconciled and scanned_in:
-        await send_feishu_message(
-            f"{PREFIX_ALIYUN} ✅ 本地丢失文件已重新下载并扫描入库：{folder_path}\n{_download_summary_line(downloaded)}"
-        )
-    elif not reconciled:
-        await send_feishu_message(
-            f"{PREFIX_ALIYUN} 🚨 本地丢失文件重新下载后文件数仍核对不上(已重试{RECONCILE_MAX_ATTEMPTS}次)，"
-            f"请人工确认：{folder_path}\n{_download_summary_line(downloaded)}"
-        )
+    await send_feishu_message(
+        f"{PREFIX_ALIYUN} 🚨 已判定完成的文件夹本地磁盘文件丢失(云端PDS完好)，请人工确认是否需要重新下载："
+        f"{folder_path}\n缺失{len(missing)}个文件: " + "、".join(str(n) for n in missing_names[:10])
+        + ("等" if len(missing_names) > 10 else "")
+    )
 
 
 async def _process_folder(session: AsyncSession, cli: PdsCli, folder: dict[str, Any]) -> None:
@@ -843,7 +811,7 @@ async def _process_folder(session: AsyncSession, cli: PdsCli, folder: dict[str, 
             _missing_local_files, folder, Path(settings.aliyun_download_dir)
         )
         if missing:
-            await _handle_local_files_missing(session, cli, folder, missing)
+            await _handle_local_files_missing(session, folder, missing)
         return
     if file_count > previous.file_count or size_bytes > previous.size_bytes:
         await _handle_reupload(session, cli, folder, file_entries, ready_event)
