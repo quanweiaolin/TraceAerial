@@ -38,7 +38,9 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Device, Notification, Operator, ScanDiscovery, ScanJob, Video
+from app.config import settings
+from app.models import Device, Location, Notification, Operator, ScanDiscovery, ScanJob, Video
+from app.services.geo import distance_3d_meters
 from app.services.hashing import compute_sha256_and_sha1
 from app.services.session_naming import find_session_match
 from app.services.video_metadata import extract_new_video_fields
@@ -93,14 +95,86 @@ def _folder_root(path_str: str) -> str:
 
 async def _apply_session_metadata(session: AsyncSession, video: Video, storage_path: Path) -> None:
     """从storage_path里找"飞行会话文件夹"命名规范的那一段(City_Site_Drone_
-    Height_Person_Date)，补上device_id/collected_by。找不到就什么都不做——
-    不是所有视频都来自这套命名规范(比如历史数据/其他来源)，这是尽力而为的
-    补全，不是强制要求。"""
+    Height_Person_Date)，补上device_id/collected_by/city/flight_height，
+    并尝试给这个视频分配地址(site，见_assign_city_site)。找不到就什么都
+    不做——不是所有视频都来自这套命名规范(比如历史数据/其他来源)，这是
+    尽力而为的补全，不是强制要求。"""
     match = find_session_match(storage_path)
     if match is None:
         return
     video.device_id = await _get_or_create_device(session, match.group("drone"))
     video.collected_by = await _get_or_create_operator(session, match.group("person"))
+    video.city = match.group("city")
+    video.flight_height = int(match.group("height"))
+    await _assign_city_site(session, video, match.group("city"), match.group("site"))
+
+
+async def _assign_city_site(
+    session: AsyncSession, video: Video, city: str, raw_site: str
+) -> None:
+    """GPS+高度聚类的"领导者算法"(在线/增量版，2026-10-29设计讨论敲定)：
+    按locations表里这个city下已有的全部地址，逐个检查新点跟该地址下videos
+    表里现有全部成员(不是只跟某个中心点比)的三维距离，要求全部<=阈值才算
+    可以加入——locations表本身只存地址标签+阈值+创建时间，不单独存成员
+    坐标，"簇内全部成员"直接就是videos表里已经打了这个(city, site)标签的
+    记录，省一份重复存储，也不会因为两份数据不同步出问题。
+
+    候选地址范围是整个city下的全部已有地址，不限制必须跟这次视频文件夹
+    自己写的site分段同名——物理聚类应该只看GPS位置，跟飞手文件夹怎么
+    命名无关，site分段只用来给"新建的地址"取名字前缀。
+
+    没有GPS坐标(collect_lon/lat为空)的视频不参与聚类，video.site保持
+    NULL；地址一旦分配不会再改(调用方保证video是刚入库、site还是空的
+    新记录，不会对已有地址的视频重新判定)。"""
+    if video.collect_lon is None or video.collect_lat is None:
+        return
+    height = video.srt_height if video.srt_height is not None else float(video.flight_height)
+
+    existing_sites_result = await session.execute(
+        select(Location.site).where(Location.city == city).order_by(Location.created_at)
+    )
+    for (candidate_site,) in existing_sites_result:
+        members_result = await session.execute(
+            select(Video.collect_lon, Video.collect_lat, Video.srt_height, Video.flight_height)
+            .where(Video.city == city)
+            .where(Video.site == candidate_site)
+            .where(Video.deleted_at.is_(None))
+        )
+        members = members_result.all()
+        if not members:
+            continue
+        fits = all(
+            distance_3d_meters(
+                video.collect_lon, video.collect_lat, height,
+                m_lon, m_lat, m_srt_height if m_srt_height is not None else float(m_flight_height),
+            ) <= settings.address_cluster_max_diameter_meters
+            for m_lon, m_lat, m_srt_height, m_flight_height in members
+        )
+        if fits:
+            video.site = candidate_site
+            return
+
+    # 没有任何已有地址能装下这个新点，新建一个地址。命名"{raw_site}_{序号}"，
+    # 序号在同city+同raw_site前缀下递增，不同raw_site前缀各自独立计数
+    prefix_sites_result = await session.execute(
+        select(Location.site)
+        .where(Location.city == city)
+        .where(Location.site.like(f"{raw_site}_%"))
+    )
+    existing_indexes = [
+        int(label[len(raw_site) + 1:])
+        for (label,) in prefix_sites_result
+        if label[len(raw_site) + 1:].isdigit()
+    ]
+    new_site = f"{raw_site}_{max(existing_indexes, default=0) + 1}"
+    session.add(
+        Location(
+            city=city,
+            site=new_site,
+            threshold_meters=settings.address_cluster_max_diameter_meters,
+        )
+    )
+    video.site = new_site
 
 
 async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:

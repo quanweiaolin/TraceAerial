@@ -100,6 +100,14 @@ _GPS_KV_PATTERN = re.compile(
 # 早期DJI机型(如Phantom/Mavic Pro) GPS(lon,lat,alt)函数式格式
 _GPS_FUNC_PATTERN = re.compile(r"GPS\(\s*(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)\s*,")
 
+# 较新DJI机型同一帧里还带 rel_alt(相对起飞点的高度)/abs_alt(海拔高度，不用)，
+# 比如 [rel_alt: 101.500 abs_alt: 151.500]——地址聚类(见scanner.py的
+# _assign_city_site)要的是实际飞行高度，rel_alt才对，abs_alt混入了地面
+# 本身的海拔，不能用。早期GPS(lon,lat,alt)函数式格式里的alt到底是相对
+# 高度还是绝对高度，这次没有真机样本验证过，所以这里先不解析——srt_height
+# 对老格式视频永久是None，不是bug，等拿到老格式真机样本确认了再补
+_REL_ALT_PATTERN = re.compile(r"\[rel_alt\s*:\s*(-?\d+\.?\d*)")
+
 
 def extract_new_video_fields(path: str | Path) -> dict:
     """整合probe_video + GPS提取，返回能直接拆包进Video(...)/UPDATE的字段dict。
@@ -113,13 +121,15 @@ def extract_new_video_fields(path: str | Path) -> dict:
         Path(path).stat().st_mtime, tz=timezone.utc
     )
 
-    # GPS：同名.srt存在就尝试解析，解析不出来(没有srt/格式不认识)保持None
+    # GPS+高度：同名.srt存在就尝试解析，解析不出来(没有srt/格式不认识)保持None
     collect_lon = collect_lat = None
+    srt_height = None
     srt_path = find_srt_sidecar(path)
     if srt_path is not None:
         gps = extract_gps_from_srt(srt_path)
         if gps is not None:
             collect_lon, collect_lat = gps
+        srt_height = extract_rel_alt_from_srt(srt_path)
 
     return {
         "duration_seconds": meta["duration_seconds"],
@@ -130,6 +140,7 @@ def extract_new_video_fields(path: str | Path) -> dict:
         "collected_at": collected_at,
         "collect_lon": collect_lon,
         "collect_lat": collect_lat,
+        "srt_height": srt_height,
     }
 
 
@@ -155,5 +166,23 @@ def extract_gps_from_srt(srt_path: str | Path) -> tuple[float, float] | None:
     if func_match:
         lon, lat = float(func_match.group(1)), float(func_match.group(2))
         return lon, lat
+
+    return None
+
+
+def extract_rel_alt_from_srt(srt_path: str | Path) -> float | None:
+    """从SRT遥测字幕里提取一个代表性飞行高度(取第一条能解析出来的rel_alt，
+    跟extract_gps_from_srt取第一条GPS记录是同一个思路)。
+
+    返回值对应 videos.srt_height；只认新格式的rel_alt标签，解析不出来
+    (没有srt/是老格式/字段缺失)时返回None。"""
+    try:
+        text = Path(srt_path).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+
+    match = _REL_ALT_PATTERN.search(text)
+    if match:
+        return float(match.group(1))
 
     return None

@@ -46,5 +46,11 @@ class Settings(BaseSettings):
     # 航测视频单个文件常常几GB，60s不够传完(见2026-09-25实际报警)
     aliyun_download_timeout_seconds: int = 1800
 
+    # 地址聚类(GPS+高度)：同一个地址(locations表一行)内任意两点最大距离(米)，
+    # 下游要拿同地址的多个视频做SIFT对齐/稳像，20m是为了控制对齐后黑边大小
+    # (2026-10-29敲定)。只影响新建地址的判定，改这个值不会动已经分配好的
+    # videos.site(locations表记录了当时生效的阈值，供追溯)
+    address_cluster_max_diameter_meters: float = 20.0
+
 
 settings = Settings()

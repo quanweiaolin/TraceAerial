@@ -75,6 +75,19 @@ class Video(Base):
     collected_by: Mapped[int | None] = mapped_column(ForeignKey("operators.id"))
     collect_lon: Mapped[float | None]
     collect_lat: Mapped[float | None]
+    # 2026-10-29加：地址聚类(给下游多视频SIFT对齐用)。city/flight_height从
+    # storage_path里符合会话命名规范(session_naming.SESSION_FOLDER_RE)那段
+    # 直接读；site是聚类后的最终地址标签(如panshiroad_1，不是正则里裸的
+    # site分组值)，一旦分配给某个视频就不可再改，只有符合命名规范+有GPS
+    # 坐标(collect_lon/lat)的视频才会被分配，见scanner.py的
+    # _apply_session_metadata/_assign_city_site。srt_height是SRT遥测里
+    # 实际记录的高度(rel_alt，相对起飞点)，跟flight_height(文件夹名里的
+    # 标称高度)分开存，聚类时height维度优先用srt_height，没有才退回
+    # flight_height
+    city: Mapped[str | None] = mapped_column(Text)
+    site: Mapped[str | None] = mapped_column(Text)
+    flight_height: Mapped[int | None]
+    srt_height: Mapped[float | None]
     # 同一个storage_path上的视频被重新编码(比如瘦身转码)会产生新sha256；
     # 这个自引用字段指回被替代的旧sha256，旧记录靠deleted_at软删除下线，
     # 保留血缘方便追溯"这个位置的视频历史上有过哪些版本"。见scanner.py处理逻辑。
@@ -89,6 +102,24 @@ class Video(Base):
     pipeline_status: Mapped[list["VideoPipelineStatus"]] = relationship(
         back_populates="video"
     )
+
+
+class Location(Base):
+    """GPS聚类得到的"地址"注册表：只记录地址标签本身+聚类时生效的阈值+
+    创建时间，不存中心点坐标——判断一个新视频是否该归到某个已有地址时，
+    领导者算法要求"跟簇内所有已有成员比距离"，而这些成员本身就是videos
+    表里已经打上同一个(city, site)标签的记录，不用在这里重复存一份坐标
+    (见scanner.py的_assign_city_site)。地址一旦分配给某个视频就不可再
+    改(immutable)，新物理地址只会新增一行，不会合并/删除已有的。"""
+
+    __tablename__ = "locations"
+    __table_args__ = (UniqueConstraint("city", "site"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    city: Mapped[str] = mapped_column(Text)
+    site: Mapped[str] = mapped_column(Text)
+    threshold_meters: Mapped[float]
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class PipelineStage(Base):
