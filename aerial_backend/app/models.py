@@ -53,6 +53,13 @@ class Video(Base):
     # 数据库里是BYTEA(32字节)；Python侧交互时统一用hex字符串更方便，
     # 具体转换见 services/hashing.py 的 sha256_hex_to_bytes/bytes_to_hex
     sha256: Mapped[bytes] = mapped_column(LargeBinary(32), primary_key=True)
+    # 2026-10-28加：阿里云PDS返回的content_hash字段本身就是sha1(不是sha256，
+    # 两者算法不同、不能互相比对)，专门给aliyun_sync下载前查重用("这份内容
+    # 是不是已经在我们系统里了，不管它现在实际存在哪个路径")，不是内容身份
+    # 的主键，sha256仍然是。只在扫盘第一次真正读文件算哈希时顺带算出来
+    # (services/hashing.py的compute_sha256_and_sha1)，历史数据和已经被瘦身
+    # 替换、原始字节已经不在的旧记录，这一列会是NULL，物理上补不出来。
+    sha1: Mapped[bytes | None] = mapped_column(LargeBinary(20))
     original_name: Mapped[str] = mapped_column(Text)
     storage_path: Mapped[str] = mapped_column(Text)
     file_size_bytes: Mapped[int | None] = mapped_column(BigInteger)

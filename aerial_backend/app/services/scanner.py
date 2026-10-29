@@ -39,7 +39,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Device, Notification, Operator, ScanDiscovery, ScanJob, Video
-from app.services.hashing import compute_sha256
+from app.services.hashing import compute_sha256_and_sha1
 from app.services.session_naming import find_session_match
 from app.services.video_metadata import extract_new_video_fields
 
@@ -171,14 +171,17 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
         session.add(discovery)
         await session.flush()
 
+        sha1_digest = None  # 只有真正读文件重新算哈希时才会有值，见下面
         if cached_sha256 is not None:
             digest = cached_sha256
         else:
             try:
-                # compute_sha256是同步阻塞IO(读整个视频文件)，直接调用会卡住
-                # 整个asyncio事件循环，导致同一进程里其他协程(比如每分钟一次的
-                # scheduled_notify)被拖慢甚至"missed"。丢进线程池执行。
-                digest = await asyncio.to_thread(compute_sha256, path)
+                # compute_sha256_and_sha1是同步阻塞IO(读整个视频文件)，直接
+                # 调用会卡住整个asyncio事件循环，导致同一进程里其他协程(比如
+                # 每分钟一次的scheduled_notify)被拖慢甚至"missed"。丢进线程池
+                # 执行。顺带算出sha1(2026-10-28加，专门给阿里云下载前查重用，
+                # 不用额外多读一遍文件)
+                digest, sha1_digest = await asyncio.to_thread(compute_sha256_and_sha1, path)
             except OSError as e:
                 discovery.hash_status = "error"
                 discovery.error_message = str(e)
@@ -217,6 +220,7 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
             new_fields = await asyncio.to_thread(extract_new_video_fields, path)
             video = Video(
                 sha256=digest,
+                sha1=sha1_digest,
                 original_name=path.name,
                 storage_path=str(path),
                 file_size_bytes=file_size,
