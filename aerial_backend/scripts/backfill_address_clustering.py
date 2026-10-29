@@ -180,7 +180,14 @@ async def main(database_url: str, apply: bool, threshold_meters: float) -> None:
                 continue
             matched += 1
 
-            row = VideoRow(r["sha256"], r["storage_path"], r["collect_lon"], r["collect_lat"])
+            # collect_lon/collect_lat在DB里是NUMERIC，asyncpg会返回
+            # decimal.Decimal而不是float——这批行里有些会在下面被重新解析
+            # 的SRT坐标(float)覆盖，有些(sidecar找不到)保留这里的DB旧值，
+            # 两种类型混在同一个rows列表里做距离运算会直接报TypeError，
+            # 这里统一转成float规避
+            db_lon = float(r["collect_lon"]) if r["collect_lon"] is not None else None
+            db_lat = float(r["collect_lat"]) if r["collect_lat"] is not None else None
+            row = VideoRow(r["sha256"], r["storage_path"], db_lon, db_lat)
             row.city = match.group("city")
             row.raw_site = match.group("site")
             row.flight_height = int(match.group("height"))
