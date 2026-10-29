@@ -45,7 +45,7 @@ import shutil
 import sys
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -612,7 +612,11 @@ async def _trigger_download(
 
 
 async def _handle_reupload(
-    session: AsyncSession, cli: PdsCli, folder: dict[str, Any], file_entries: list[dict[str, Any]]
+    session: AsyncSession,
+    cli: PdsCli,
+    folder: dict[str, Any],
+    file_entries: list[dict[str, Any]],
+    ready_event: AliyunSyncEvent,
 ) -> None:
     folder_path = folder["cloud_folder_path"]
     if not await ensure_enough_space(settings.aliyun_download_dir):
@@ -636,6 +640,27 @@ async def _handle_reupload(
     await send_feishu_message(
         f"{PREFIX_ALIYUN} ⚠️ 已判定完成的文件夹又有新上传：{folder_path}\n{_download_summary_line(downloaded)}"
     )
+
+    # 2026-10-28新加：这次重新上传离"当初判定完成"已经超过稳定期阈值
+    # (settings.aliyun_stability_scans_required * 心跳间隔，眼下是10天，
+    # 跟/aliyun/folders-ready用的是同一个算法，以后改配置两边自动一起变)，
+    # 说明飞手不是"刚传完、隔几个小时又补了点"这种正常节奏，而是系统/团队
+    # 都已经把这个文件夹当成"早就完事了"很久之后又冒出来，更可能是飞手
+    # 本身操作习惯有问题，单独点名报出来，方便拿去跟具体的人宣贯
+    stable_hours = settings.aliyun_stability_scans_required * ALIYUN_SCAN_INTERVAL_HOURS
+    is_overdue = (
+        ready_event.download_finished_at is not None
+        and download_started_at - ready_event.download_finished_at > timedelta(hours=stable_hours)
+    )
+    if is_overdue:
+        session_name = folder["session_name"]
+        match = SESSION_FOLDER_RE.match(session_name)
+        uploader = match.group("person") if match else "未知"
+        await send_feishu_message(
+            f"{PREFIX_ALIYUN} 📢 已判定完成上传的文件夹再次上传，"
+            f"上传者为 {uploader}，上传文件夹为 {folder_path}，应对此进行宣贯"
+        )
+
     if not reconciled:
         # 同_trigger_download那边的道理：重试RECONCILE_MAX_ATTEMPTS次后文件数
         # 还是对不上，单独报一条，别混在上面那条"又有新上传"里不显眼
@@ -711,7 +736,7 @@ async def _process_folder(session: AsyncSession, cli: PdsCli, folder: dict[str, 
     if not changed:
         return
     if file_count > previous.file_count or size_bytes > previous.size_bytes:
-        await _handle_reupload(session, cli, folder, file_entries)
+        await _handle_reupload(session, cli, folder, file_entries, ready_event)
     else:
         await _handle_possible_deletion(session, folder, file_entries)
 
