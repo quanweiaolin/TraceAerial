@@ -79,6 +79,8 @@ from pds_sync.core import (  # noqa: E402  (必须在sys.path插入之后才能i
     list_drives,
 )
 
+PREFIX_ALIYUN = "【阿里云下载】"  # 2026-10-28起，这个模块发的飞书消息统一加这个前缀
+
 
 def _cli_binary_path() -> Path:
     configured = settings.aliyun_cli_binary
@@ -121,7 +123,7 @@ async def ensure_enough_space(path: str | Path, min_free_gb: float | None = None
         return True
     print(f"[aliyun] 磁盘空间不足：{path} 剩余 {free_gb:.1f} GiB，低于阈值 {threshold:.0f} GiB", flush=True)
     await send_feishu_message(
-        f"⚠️ 磁盘空间不足，暂停阿里云下载：{path} 所在盘剩余 {free_gb:.1f} GiB，"
+        f"{PREFIX_ALIYUN} ⚠️ 磁盘空间不足，暂停阿里云下载：{path} 所在盘剩余 {free_gb:.1f} GiB，"
         f"低于阈值 {threshold:.0f} GiB"
     )
     return False
@@ -399,7 +401,7 @@ async def _download_folder_files(folder: dict[str, Any], cli: PdsCli) -> list[di
                 _download_one_file, download_cli, local_relative, raw_item, Path(settings.aliyun_download_dir)
             )
         except (PdsError, OSError, ValueError) as exc:
-            await send_feishu_message(f"⚠️ 阿里云下载失败：{folder_path} 里的 {relative_path}：{exc}")
+            await send_feishu_message(f"{PREFIX_ALIYUN} ⚠️ 下载失败：{folder_path} 里的 {relative_path}：{exc}")
             downloaded.append({
                 "cloud_file_id": raw_item.get("file_id"),
                 "cloud_path": cloud_path,
@@ -519,7 +521,7 @@ async def _report_invalid_session_name(session: AsyncSession, candidate: dict[st
         notified_at=datetime.now(timezone.utc),
     ))
     print(f"[aliyun] 命名不符合规范，拒绝下载：{folder_path}\n  {reason}", flush=True)
-    await send_feishu_message(f"⚠️ 文件夹命名不符合规范，已跳过下载：{folder_path}\n{reason}")
+    await send_feishu_message(f"{PREFIX_ALIYUN} ⚠️ 文件夹命名不符合规范，已跳过下载：{folder_path}\n{reason}")
 
 
 async def _trigger_download(
@@ -565,7 +567,7 @@ async def _trigger_download(
             except Exception as exc:  # noqa: BLE001  范围特意放宽：扫描入库这一步绝不能让整个扫描循环中断
                 scanned_in = False
                 print(f"[aliyun] 下载完成但扫描入库失败：{local_folder}  {exc}", flush=True)
-                await send_feishu_message(f"⚠️ 阿里云下载完成但扫描入库失败：{folder_path}\n{exc}")
+                await send_feishu_message(f"{PREFIX_ALIYUN} ⚠️ 下载完成但扫描入库失败：{folder_path}\n{exc}")
     all_succeeded = all_succeeded and scanned_in
 
     session.add(AliyunSyncEvent(
@@ -585,7 +587,7 @@ async def _trigger_download(
     ))
     if all_succeeded:
         await send_feishu_message(
-            f"✅ 阿里云文件夹下载完成并已扫描入库：{folder_path}\n{_download_summary_line(downloaded)}"
+            f"{PREFIX_ALIYUN} ✅ 文件夹下载完成并已扫描入库：{folder_path}\n{_download_summary_line(downloaded)}"
         )
     elif not reconciled:
         # 跟"处理未全部成功"分开报——那条是单个文件下载/扫描报了异常，这条是
@@ -593,12 +595,12 @@ async def _trigger_download(
         # 更可能是真实数据缺失，需要人工确认，不是"下次心跳自动重试"就能
         # 解决的(2026-10-22达成一致)
         await send_feishu_message(
-            f"🚨 阿里云文件夹下载后文件数核对不上(已重试{RECONCILE_MAX_ATTEMPTS}次)，"
+            f"{PREFIX_ALIYUN} 🚨 文件夹下载后文件数核对不上(已重试{RECONCILE_MAX_ATTEMPTS}次)，"
             f"请人工确认：{folder_path}\n{_download_summary_line(downloaded)}"
         )
     else:
         await send_feishu_message(
-            f"⚠️ 阿里云文件夹处理未全部成功，下次心跳会自动重试：{folder_path}\n{_download_summary_line(downloaded)}"
+            f"{PREFIX_ALIYUN} ⚠️ 文件夹处理未全部成功，下次心跳会自动重试：{folder_path}\n{_download_summary_line(downloaded)}"
         )
 
 
@@ -625,14 +627,14 @@ async def _handle_reupload(
         notified_at=datetime.now(timezone.utc),
     ))
     await send_feishu_message(
-        f"⚠️ 已判定完成的文件夹又有新上传：{folder_path}\n{_download_summary_line(downloaded)}"
+        f"{PREFIX_ALIYUN} ⚠️ 已判定完成的文件夹又有新上传：{folder_path}\n{_download_summary_line(downloaded)}"
     )
     if not reconciled:
         # 同_trigger_download那边的道理：重试RECONCILE_MAX_ATTEMPTS次后文件数
         # 还是对不上，单独报一条，别混在上面那条"又有新上传"里不显眼
         # (2026-10-22达成一致)
         await send_feishu_message(
-            f"🚨 阿里云文件夹下载后文件数核对不上(已重试{RECONCILE_MAX_ATTEMPTS}次)，"
+            f"{PREFIX_ALIYUN} 🚨 文件夹下载后文件数核对不上(已重试{RECONCILE_MAX_ATTEMPTS}次)，"
             f"请人工确认：{folder_path}\n{_download_summary_line(downloaded)}"
         )
 
@@ -660,7 +662,7 @@ async def _handle_possible_deletion(
     detail = "、".join(missing_names) if missing_names else "(具体文件名对比不出来，可能是历史记录不足)"
     print(f"[aliyun] 完成后检测到文件被删除：{folder_path}，疑似丢失：{detail}", flush=True)
     await send_feishu_message(
-        f"⚠️ 已判定完成的文件夹里有文件不见了：{folder_path}，疑似被删除：{detail}"
+        f"{PREFIX_ALIYUN} ⚠️ 已判定完成的文件夹里有文件不见了：{folder_path}，疑似被删除：{detail}"
     )
 
 

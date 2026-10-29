@@ -40,6 +40,11 @@ from app.config import settings
 from app.models import Notification, Video
 
 MAX_RETRY = 5
+PREFIX_SCAN = "【数据库扫描】"  # 2026-10-28起，数据库扫描(scanner.py)相关的飞书
+# 消息统一加这个前缀，方便一眼看出是哪个组件发的；以后新增组件照这个惯例来
+SUPPRESSED_EVENT_TYPES = {"validation_escalation", "qa_batch_ready"}  # 2026-10-28
+# 决定这两类完全不发(飞书+log都不要)——数据提交校验升级、QA待标注批次这两个
+# 场景目前不需要主动通知，直接标记sent、不留任何痕迹(见当天讨论)
 NOTIFY_DEBOUNCE_SECONDS = 600  # 同一文件夹最后一条pending通知的created_at距今不足10分钟，
 # 说明这个文件夹大概率还在被扫描任务陆续发现新文件(大文件夹会被扫盘按
 # COMMIT_BATCH_SIZE拆成好几个批次)，先不发，等这个文件夹静默够10分钟
@@ -78,8 +83,8 @@ def _format_message(n: Notification) -> str:
         "stage_failed": "❌ 阶段处理失败：视频 {video} 在阶段 {stage} 出错：{error}",
         "validation_escalation": "⚠️ {username} 连续 {count} 次数据提交校验失败，请协助确认",
         "qa_batch_ready": "🔍 新一批检测QA待标注，共 {count} 个视频，请及时处理",
-        "folder_moved": "📦 文件夹被整体移动，请知悉\n原位置：{old_folder}\n新位置：{new_folder}\n共 {file_count} 个视频",
-        "folder_duplicate": "⚠️ 同一批视频在两个位置都真实存在，疑似重复下载/拷贝，请确认后手动清理\n位置A：{old_folder}\n位置B：{new_folder}\n共 {file_count} 个视频",
+        "folder_moved": f"{PREFIX_SCAN} 📦 文件夹被整体移动，请知悉\n原位置：{{old_folder}}\n新位置：{{new_folder}}\n共 {{file_count}} 个视频",
+        "folder_duplicate": f"{PREFIX_SCAN} ⚠️ 同一批视频在两个位置都真实存在，疑似重复下载/拷贝，请确认后手动清理\n位置A：{{old_folder}}\n位置B：{{new_folder}}\n共 {{file_count}} 个视频",
     }
     payload = n.payload or {}
     template = templates.get(n.event_type, "{payload}")
@@ -125,84 +130,121 @@ def _mark_sent_or_retry(n: Notification, ok: bool) -> None:
             n.status = "failed"
 
 
-async def process_pending_notifications(session: AsyncSession, batch_size: int = 50) -> int:
-    """由定时任务(比如每分钟)调用一次，返回本次处理的条数。
+async def _process_grouped_video_notifications(
+    session: AsyncSession,
+    event_type: str,
+    build_message,
+    *,
+    feishu_enabled: bool,
+    emit_cross_program_notify: bool,
+) -> int:
+    """new_task/re_encoded共用的"按文件夹分组+静默期debounce"逻辑：扫盘按
+    COMMIT_BATCH_SIZE分批提交，一个大文件夹一次扫描会产生好几批pending
+    通知，这里统一等这个文件夹静默够NOTIFY_DEBOUNCE_SECONDS(大概率已经
+    扫完了，不会再有同一文件夹的新通知陆续进来)才合并成一条消息发出去，
+    不按每次提交各发一条——new_task这边2026-10-16就因为没做这个处理，
+    一个265个视频的文件夹被拆成6条外观雷同的消息刷屏；re_encoded(瘦身
+    转码)同样的风险：2026-09-29发现过一晚上202个瘦身更新。
 
-    new_task这类通知按"视频所在的直接父文件夹"分组合并成一条消息发送，
-    避免一次扫盘发现一堆新视频时逐条刷屏；其他event_type照常逐条发送。
-
-    new_task分组还要过一道"静默期"：只有当某个文件夹最新一条pending通知
-    的created_at距今已经超过NOTIFY_DEBOUNCE_SECONDS，才把这个文件夹现存
-    的所有pending通知合并成一条发出去；否则说明扫盘可能还没扫完这个文件夹
-    (大文件夹会被COMMIT_BATCH_SIZE拆成好几批)，这一轮先跳过，等下一分钟
-    再看静默够了没。所以new_task这边不用batch_size限制查询范围——要看到
-    某个文件夹的全部pending才能判断"是不是还在涨"。
+    feishu_enabled=False时只打日志、不真的调用飞书(用于暂时关闭某个
+    event_type的飞书推送，但还想保留处理记录，不堆积成pending)。
+    emit_cross_program_notify=True时，debounce满足的同时顺带给跨程序的
+    LISTEN订阅者推一次(见模块docstring"跨程序集成")——目前只有new_task
+    需要，re_encoded是替换旧视频，不是下游Claude API标注关心的"新环境"。
     """
-    other_result = await session.execute(
+    result = await session.execute(
         select(Notification)
         .where(Notification.status == "pending")
         .where(Notification.retry_count < MAX_RETRY)
-        .where(Notification.event_type != "new_task")
-        .limit(batch_size)
+        .where(Notification.event_type == event_type)
     )
-    other_notifications = other_result.scalars().all()
-    for n in other_notifications:
-        message_text = _format_message(n)
-        ok = await send_feishu_message(message_text)
-        _mark_sent_or_retry(n, ok)
-
-    new_task_result = await session.execute(
-        select(Notification)
-        .where(Notification.status == "pending")
-        .where(Notification.retry_count < MAX_RETRY)
-        .where(Notification.event_type == "new_task")
-    )
-    new_task_notifications = new_task_result.scalars().all()
+    notifications = result.scalars().all()
 
     groups: dict[str, list[Notification]] = defaultdict(list)
-    for n in new_task_notifications:
+    for n in notifications:
         file_path = (n.payload or {}).get("file_path", "")
         folder = str(Path(file_path).parent) if file_path else "(未知路径)"
         groups[folder].append(n)
 
     now = datetime.now(timezone.utc)
-    sent_new_task_count = 0
+    sent_count = 0
     for folder, group in groups.items():
         latest_created = max(n.created_at for n in group)
         if (now - latest_created).total_seconds() < NOTIFY_DEBOUNCE_SECONDS:
             continue
-        message_text = f"🆕 新视频入库，请及时认领处理\n📁 {folder}\n共 {len(group)} 个视频"
-        # 2026-10-28暂停这条飞书消息：粒度太细(按10分钟静默期分组，不是按
-        # "地点真的传完了")、跟aliyun那边的完成判定也只是弱相关，不该被
-        # 下游标注团队当成开工信号用，见当天讨论——等"地点级完成通知"设计
-        # 出来再决定要不要恢复。只留日志，不占用飞书重试机制，直接标记
-        # sent(没有真的发，但这条处理完了，不需要再被下一轮捞到)
-        print(f"[notify] (飞书已暂停，仅记日志) {message_text}", flush=True)
+        message_text = build_message(folder, group)
+        if feishu_enabled:
+            ok = await send_feishu_message(message_text)
+        else:
+            print(f"[notify] (飞书已暂停，仅记日志) {message_text}", flush=True)
+            ok = True
         for n in group:
-            _mark_sent_or_retry(n, True)
-        sent_new_task_count += len(group)
+            _mark_sent_or_retry(n, ok)
+        sent_count += len(group)
 
-        # 跟飞书用同一个debounce判断(这个文件夹静默够了)，顺带给跨程序的
-        # LISTEN订阅者推一次(见模块docstring"跨程序集成")——不管飞书那条
-        # 发没发成功都推，这个通道不走飞书的重试机制，NOTIFY本身就是
-        # at-most-once、下游要自己保证幂等(存不存在sha256对应的标注结果)
-        video_names = [
-            n.payload.get("original_name")
-            for n in group
-            if n.payload and n.payload.get("original_name")
-        ]
-        if video_names:
-            for chunk in _chunk_video_names(folder, video_names):
-                await session.execute(
-                    text("SELECT pg_notify(:channel, :payload)"),
-                    {
-                        "channel": NEW_VIDEO_NOTIFY_CHANNEL,
-                        "payload": json.dumps({"folder": folder, "video_names": chunk}),
-                    },
-                )
+        if emit_cross_program_notify:
+            video_names = [
+                n.payload.get("original_name")
+                for n in group
+                if n.payload and n.payload.get("original_name")
+            ]
+            if video_names:
+                for chunk in _chunk_video_names(folder, video_names):
+                    await session.execute(
+                        text("SELECT pg_notify(:channel, :payload)"),
+                        {
+                            "channel": NEW_VIDEO_NOTIFY_CHANNEL,
+                            "payload": json.dumps({"folder": folder, "video_names": chunk}),
+                        },
+                    )
+    return sent_count
+
+
+async def process_pending_notifications(session: AsyncSession, batch_size: int = 50) -> int:
+    """由定时任务(比如每分钟)调用一次，返回本次处理的条数。
+
+    new_task/re_encoded这两类按"视频所在的直接父文件夹"分组+静默期debounce
+    合并成一条消息发送(见_process_grouped_video_notifications)，避免一次
+    扫盘发现一堆视频时逐条刷屏；其他event_type照常逐条发送，其中
+    SUPPRESSED_EVENT_TYPES这两类(校验升级/QA待标注批次)2026-10-28起完全
+    不发，飞书和log都没有，只标记sent。
+    """
+    other_result = await session.execute(
+        select(Notification)
+        .where(Notification.status == "pending")
+        .where(Notification.retry_count < MAX_RETRY)
+        .where(Notification.event_type.not_in(["new_task", "re_encoded"]))
+        .limit(batch_size)
+    )
+    other_notifications = other_result.scalars().all()
+    for n in other_notifications:
+        if n.event_type in SUPPRESSED_EVENT_TYPES:
+            _mark_sent_or_retry(n, True)
+            continue
+        message_text = _format_message(n)
+        ok = await send_feishu_message(message_text)
+        _mark_sent_or_retry(n, ok)
+
+    sent_new_task_count = await _process_grouped_video_notifications(
+        session,
+        "new_task",
+        lambda folder, group: f"{PREFIX_SCAN} 🆕 新视频入库，请及时认领处理\n📁 {folder}\n共 {len(group)} 个视频",
+        # 2026-10-28暂停：粒度太细(按10分钟静默期分组，不是按"地点真的传完
+        # 了")、跟aliyun那边的完成判定也只是弱相关，不该被下游标注团队当成
+        # 开工信号用，见当天讨论——等"地点级完成通知"设计出来再决定要不要恢复
+        feishu_enabled=False,
+        emit_cross_program_notify=True,
+    )
+    sent_re_encoded_count = await _process_grouped_video_notifications(
+        session,
+        "re_encoded",
+        lambda folder, group: f"{PREFIX_SCAN} 🔄 检测到瘦身转码(重新编码)\n📁 {folder}\n共 {len(group)} 个视频",
+        feishu_enabled=True,  # 2026-10-28新加，之前只在每日汇总里统计，现在额外发即时消息
+        emit_cross_program_notify=False,
+    )
 
     await session.commit()
-    return len(other_notifications) + sent_new_task_count
+    return len(other_notifications) + sent_new_task_count + sent_re_encoded_count
 
 
 async def send_daily_summary(session: AsyncSession) -> None:

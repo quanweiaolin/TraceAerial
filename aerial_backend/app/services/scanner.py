@@ -255,16 +255,26 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
                 discovery.is_new_task = True
 
                 if is_re_encode:
-                    # 旧记录软删除下线，不物理删除，历史数据还在；不发即时飞书通知，
-                    # 走每日汇总(services/notifier.send_daily_summary)统计"今日更新了多少视频"。
-                    # 汇总要等第二天9点才发、还按天切窗口，扫描当下看不出真实检测到几个，
-                    # 所以这里直接打印，扫完数一下log就知道这次扫描实际检测到多少次瘦身更新
+                    # 旧记录软删除下线，不物理删除，历史数据还在。瘦身汇总
+                    # (services/notifier.send_daily_summary)还是照常跑，
+                    # 但2026-10-28改成额外发一条即时飞书通知——跟new_task用
+                    # 同一套"按文件夹+10分钟静默期"分组debounce(见notifier.py)，
+                    # 不是逐个视频立刻发，不然09-29那次一晚上202个瘦身更新会
+                    # 刷屏
                     print(
                         f"[scan] 检测到瘦身转码: {path}  "
                         f"{old_active.sha256.hex()[:12]}... -> {digest.hex()[:12]}...",
                         flush=True,
                     )
                     old_active.deleted_at = datetime.now(timezone.utc)
+                    session.add(
+                        Notification(
+                            video_sha256=digest,
+                            event_type="re_encoded",
+                            channel="feishu",
+                            payload={"file_path": str(path), "original_name": path.name},
+                        )
+                    )
                 else:
                     # 真新增：insert videos 会触发DB里 trg_init_pipeline_status(若已建)，
                     # 自动为它生成8个阶段的pending状态行；触发器还没建时这一步只是单纯insert
