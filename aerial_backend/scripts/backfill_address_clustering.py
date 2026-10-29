@@ -97,6 +97,53 @@ def _max_pairwise_distance(members: list[VideoRow]) -> float:
     )
 
 
+def _nearest_other(row: VideoRow, all_rows: list[VideoRow]) -> tuple[VideoRow, float] | None:
+    """在同city的全部候选点里(不分簇)，找离row最近的另一个点及距离——用于
+    诊断"只有1个成员的簇"到底是真的物理上孤立，还是卡在阈值边缘/数据有
+    问题(比如height来源对不上导致算出来的距离被人为拉大)。"""
+    best = None
+    for other in all_rows:
+        if other is row:
+            continue
+        d = distance_3d_meters(row.lon, row.lat, _height_of(row), other.lon, other.lat, _height_of(other))
+        if best is None or d < best[1]:
+            best = (other, d)
+    return best
+
+
+def _diagnose_small_cluster(members: list[VideoRow], all_rows: list[VideoRow], threshold_meters: float) -> None:
+    """簇成员数<=2时，打印每个成员的原始坐标/高度来源，以及它在整个city里
+    (不限于本簇)最近的邻居是谁、距离多少——方便判断是真孤立还是height
+    来源(srt_height缺失退回flight_height)把距离人为拉大了。"""
+    member_ids = {id(m) for m in members}
+    for m in members:
+        height_source = "srt_height" if m.srt_height is not None else "flight_height(回退)"
+        print(
+            f"        {m.storage_path}\n"
+            f"          lon={m.lon:.6f} lat={m.lat:.6f} "
+            f"height={_height_of(m):.1f}({height_source}) "
+            f"srt_height={m.srt_height} flight_height={m.flight_height}"
+        )
+        nearest = _nearest_other(m, all_rows)
+        if nearest is None:
+            continue
+        other, dist = nearest
+        other_source = "srt_height" if other.srt_height is not None else "flight_height(回退)"
+        # 最近邻如果不在本簇里、但距离又在阈值内，说明complete-linkage没把
+        # 它俩合并是因为链式约束(跟簇里别的成员距离超了)，不是算法bug，但
+        # 值得人工看一眼
+        flag = (
+            " ⚠️ 在阈值内但不在同一簇(可能是跟簇内其他成员的链式约束导致，建议人工确认)"
+            if dist <= threshold_meters and id(other) not in member_ids
+            else ""
+        )
+        print(
+            f"          最近邻: {other.storage_path} 距离={dist:.2f}m{flag}\n"
+            f"          最近邻height={_height_of(other):.1f}({other_source}) "
+            f"srt_height={other.srt_height} flight_height={other.flight_height}"
+        )
+
+
 async def main(database_url: str, apply: bool, threshold_meters: float) -> None:
     conn = await asyncpg.connect(database_url, server_settings={"search_path": "aerial,public"})
     try:
@@ -172,6 +219,8 @@ async def main(database_url: str, apply: bool, threshold_meters: float) -> None:
                     f"    {site_label}: {len(members)}个成员，簇内最大两两距离={max_dist:.2f}m"
                     + (" ⚠️ 超过阈值!" if max_dist > threshold_meters else "")
                 )
+                if len(members) <= 2:
+                    _diagnose_small_cluster(members, rows, threshold_meters)
                 location_inserts.append((city, site_label, threshold_meters))
                 for m in members:
                     video_updates.append((m.sha256, city, site_label, m.flight_height, m.srt_height))
