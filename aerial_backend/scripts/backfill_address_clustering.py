@@ -56,10 +56,10 @@ import numpy as np
 from sklearn.cluster import AgglomerativeClustering
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from app.services.geo import distance_3d_meters, latlon_to_local_meters  # noqa: E402
+from app.services.geo import distance_3d_meters, latlon_to_local_meters, trajectory_diameter_meters  # noqa: E402
 from app.services.session_naming import find_session_match  # noqa: E402
 from app.services.video_metadata import (  # noqa: E402
-    extract_gps_from_srt, extract_rel_alt_from_srt, find_srt_sidecar,
+    extract_gps_from_srt, extract_rel_alt_from_srt, extract_srt_trajectory, find_srt_sidecar,
 )
 
 PROGRESS_EVERY = 200
@@ -140,6 +140,21 @@ def _diagnose_small_cluster(members: list[VideoRow], all_rows: list[VideoRow], t
             f"height={_height_of(m):.1f}({height_source}) "
             f"srt_height={m.srt_height} flight_height={m.flight_height}"
         )
+        # 轨迹诊断：区分"整段视频全程都在这个高度(可能是一次降落/起飞段的
+        # 独立文件，比如DJI按时长自动切片，最后一段整段都在降落)"还是
+        # "视频内部本身就从高到低/低到高有个过渡"——srt_height中位数已经
+        # 滤掉了开头/结尾的瞬态，如果这里diameter还是很大，说明不是瞬态，
+        # 是这条视频本身大半程都在明显移动/变高度
+        srt_path = find_srt_sidecar(m.storage_path)
+        trajectory = extract_srt_trajectory(srt_path) if srt_path is not None else None
+        if trajectory is not None and len(trajectory) >= 2:
+            heights = [h for _, _, h in trajectory]
+            diameter = trajectory_diameter_meters(trajectory)
+            print(
+                f"          自身轨迹: {len(trajectory)}帧，高度范围[{min(heights):.1f}, {max(heights):.1f}]，"
+                f"轨迹内最大位移={diameter:.2f}m"
+                + (" ⚠️ 视频内部本身就有明显移动/高度变化" if diameter > 30 else "(内部基本稳定)")
+            )
         nearest = _nearest_other(m, all_rows)
         if nearest is None:
             continue
