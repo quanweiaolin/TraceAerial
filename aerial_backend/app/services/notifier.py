@@ -172,9 +172,14 @@ async def process_pending_notifications(session: AsyncSession, batch_size: int =
         if (now - latest_created).total_seconds() < NOTIFY_DEBOUNCE_SECONDS:
             continue
         message_text = f"🆕 新视频入库，请及时认领处理\n📁 {folder}\n共 {len(group)} 个视频"
-        ok = await send_feishu_message(message_text)
+        # 2026-10-28暂停这条飞书消息：粒度太细(按10分钟静默期分组，不是按
+        # "地点真的传完了")、跟aliyun那边的完成判定也只是弱相关，不该被
+        # 下游标注团队当成开工信号用，见当天讨论——等"地点级完成通知"设计
+        # 出来再决定要不要恢复。只留日志，不占用飞书重试机制，直接标记
+        # sent(没有真的发，但这条处理完了，不需要再被下一轮捞到)
+        print(f"[notify] (飞书已暂停，仅记日志) {message_text}", flush=True)
         for n in group:
-            _mark_sent_or_retry(n, ok)
+            _mark_sent_or_retry(n, True)
         sent_new_task_count += len(group)
 
         # 跟飞书用同一个debounce判断(这个文件夹静默够了)，顺带给跨程序的
