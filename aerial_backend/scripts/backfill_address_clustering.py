@@ -4,6 +4,20 @@
 个city下GPS+高度相近的视频归到同一个"地址"，写进locations表、回填
 videos.site。
 
+同时会重新解析一遍这批视频的collect_lon/collect_lat(不是直接用DB里已经
+存的旧值)：2026-10-29发现起飞爬升阶段录的SRT，开头几条GPS/高度读数可能
+还在起飞点附近，不是真正的拍摄位置，extract_gps_from_srt/
+extract_rel_alt_from_srt已经改成取全程中位数而不是第一条，但DB里已经
+入库的旧collect_lon/collect_lat还是当年用"第一条"算出来的——这个脚本
+既然要用坐标做聚类，顺手重新解析一遍、把更准的值也写回videos表。sidecar
+SRT文件如果已经找不到了(比如被挪动/清理过)，退回用DB里的旧值，不会把
+原本有效的坐标清空成NULL。
+
+这个脚本只重新解析"符合会话命名规范"的这1245条，不是全量23844条——
+如果想给全部视频(不限于符合命名规范的)刷新collect_lon/collect_lat，
+用已有的全量回填入口：`uv run main.py --backfill --force`
+(调用的是app.services.backfill.backfill_video_metadata(only_missing=False))。
+
 complete-linkage是"一次性/离线批量初始化"专用算法：distance_threshold
 直接就是"簇内任意两点最大距离"的数学保证(合并判据本身就是两簇间最大
 pairwise距离)，但它是全局重新评估的，不能在"已经分配好的地址不能再改"
@@ -44,7 +58,9 @@ from sklearn.cluster import AgglomerativeClustering
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.services.geo import distance_3d_meters, latlon_to_local_meters  # noqa: E402
 from app.services.session_naming import find_session_match  # noqa: E402
-from app.services.video_metadata import extract_rel_alt_from_srt, find_srt_sidecar  # noqa: E402
+from app.services.video_metadata import (  # noqa: E402
+    extract_gps_from_srt, extract_rel_alt_from_srt, find_srt_sidecar,
+)
 
 PROGRESS_EVERY = 200
 
@@ -171,6 +187,12 @@ async def main(database_url: str, apply: bool, threshold_meters: float) -> None:
 
             srt_path = find_srt_sidecar(row.storage_path)
             if srt_path is not None:
+                # 用新的"全程中位数"逻辑重新解析一遍，比DB里当年用"第一条"
+                # 算出来的旧collect_lon/collect_lat更准；sidecar解析不出来
+                # (或者文件已经不在了)就保留上面从DB读到的旧值，不清空
+                gps = extract_gps_from_srt(srt_path)
+                if gps is not None:
+                    row.lon, row.lat = gps
                 row.srt_height = extract_rel_alt_from_srt(srt_path)
 
             if row.lon is None or row.lat is None:
@@ -202,7 +224,7 @@ async def main(database_url: str, apply: bool, threshold_meters: float) -> None:
 
         total_clusters = 0
         location_inserts: list[tuple[str, str, float]] = []
-        video_updates: list[tuple[bytes, str, str, int, float | None]] = []
+        video_updates: list[tuple[bytes, str, str | None, int, float | None, float | None, float | None]] = []
 
         for city, rows in sorted(by_city.items()):
             clusters = _cluster_one_city(city, rows, threshold_meters)
@@ -223,10 +245,14 @@ async def main(database_url: str, apply: bool, threshold_meters: float) -> None:
                     _diagnose_small_cluster(members, rows, threshold_meters)
                 location_inserts.append((city, site_label, threshold_meters))
                 for m in members:
-                    video_updates.append((m.sha256, city, site_label, m.flight_height, m.srt_height))
+                    video_updates.append(
+                        (m.sha256, city, site_label, m.flight_height, m.srt_height, m.lon, m.lat)
+                    )
 
         for row in text_only_updates:
-            video_updates.append((row.sha256, row.city, None, row.flight_height, row.srt_height))
+            video_updates.append(
+                (row.sha256, row.city, None, row.flight_height, row.srt_height, row.lon, row.lat)
+            )
 
         print(f"\n共{total_clusters}个新地址，{len(video_updates)}条视频记录将被更新")
 
@@ -238,11 +264,11 @@ async def main(database_url: str, apply: bool, threshold_meters: float) -> None:
                         "ON CONFLICT (city, site) DO NOTHING",
                         city, site, thr,
                     )
-                for sha256, city, site, flight_height, srt_height in video_updates:
+                for sha256, city, site, flight_height, srt_height, lon, lat in video_updates:
                     await conn.execute(
-                        "UPDATE videos SET city = $2, site = $3, flight_height = $4, srt_height = $5 "
-                        "WHERE sha256 = $1",
-                        sha256, city, site, flight_height, srt_height,
+                        "UPDATE videos SET city = $2, site = $3, flight_height = $4, srt_height = $5, "
+                        "collect_lon = $6, collect_lat = $7 WHERE sha256 = $1",
+                        sha256, city, site, flight_height, srt_height, lon, lat,
                     )
             print("已写入数据库(--apply)")
         else:

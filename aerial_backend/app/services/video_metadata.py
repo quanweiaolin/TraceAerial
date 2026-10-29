@@ -146,7 +146,14 @@ def extract_new_video_fields(path: str | Path) -> dict:
 
 
 def extract_gps_from_srt(srt_path: str | Path) -> tuple[float, float] | None:
-    """从SRT遥测字幕里提取一个代表性GPS坐标(取第一条能解析出来的记录)。
+    """从SRT遥测字幕里提取一个代表性GPS坐标：经度/纬度分别取全程所有能
+    解析出来的读数的中位数，不是只取第一条。
+
+    2026-10-29跟srt_height同一次改动、同一个原因：起飞爬升阶段/还没飞到
+    真正拍摄点时录的SRT，开头那几条经纬度可能还是起飞点附近的坐标，不是
+    这段视频真正拍摄的位置，只取第一条容易取到这类瞬态值(跟rel_alt取值
+    偏低是同一个起飞爬升阶段的症状，这里会同时影响水平位置)。中位数能
+    滤掉这种首尾瞬态值。
 
     返回 (lon, lat)，对应 videos.collect_lon / videos.collect_lat；
     解析不出来(格式不认识/文件读取失败)时返回None。
@@ -158,14 +165,16 @@ def extract_gps_from_srt(srt_path: str | Path) -> tuple[float, float] | None:
     except OSError:
         return None
 
-    kv_match = _GPS_KV_PATTERN.search(text)
-    if kv_match:
-        lat, lon = float(kv_match.group(1)), float(kv_match.group(2))
+    kv_matches = _GPS_KV_PATTERN.findall(text)
+    if kv_matches:
+        lon = statistics.median(float(lon_str) for _, lon_str in kv_matches)
+        lat = statistics.median(float(lat_str) for lat_str, _ in kv_matches)
         return lon, lat
 
-    func_match = _GPS_FUNC_PATTERN.search(text)
-    if func_match:
-        lon, lat = float(func_match.group(1)), float(func_match.group(2))
+    func_matches = _GPS_FUNC_PATTERN.findall(text)
+    if func_matches:
+        lon = statistics.median(float(lon_str) for lon_str, _ in func_matches)
+        lat = statistics.median(float(lat_str) for _, lat_str in func_matches)
         return lon, lat
 
     return None
