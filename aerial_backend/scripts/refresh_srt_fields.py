@@ -16,14 +16,23 @@
 视频本来就没有SRT)时保留DB里原有的值，不会清空成NULL——避免因为这次跑
 的时候偶然读不到文件(比如NAS抖动)把原本有效的字段冲掉。
 
+并发：读SRT(find_srt_sidecar的stat调用+读文件内容)在NAS上是网络IO，不是
+CPU，一条一条串行跑的话总耗时=23844次网络往返时间的总和，哪怕每次只要
+50ms也是接近20分钟起步(2026-10-29生产端实测确认过串行版本慢得不可用)。
+这里用--concurrency个线程同时读(asyncio.to_thread丢进线程池，IO在等待
+网络的时候不占CPU，可以大量并发)，数据库写入仍然是单连接顺序执行——写
+一行是本地postgres操作，不是瓶颈，没必要为此搞连接池。
+
 用法：
     uv run python aerial_backend/scripts/refresh_srt_fields.py \
         --database-url postgresql://user:pass@localhost:5432/aerial_db \
-        --max-drift-meters 30
+        --max-drift-meters 30 --concurrency 32
     # 不加--apply是dry-run：只读文件解析、打印统计，不写库。
     # --max-drift-meters要跟.env里AERIAL_FLIGHT_STABILITY_MAX_DRIFT_METERS
     # 一致(默认30)，这里单独传参是为了这个脚本不依赖app.config/.env，
     # 避免cwd不对导致.env读不到的问题(跟backfill_video_sha1.py同样的考虑)。
+    # --concurrency太大可能把NAS打满导致其他服务变慢，先用默认32试，
+    # 不够快可以往上调，NAS扛不住就往下调
 """
 from __future__ import annotations
 
@@ -40,7 +49,19 @@ from app.services.video_metadata import extract_srt_fields, find_srt_sidecar  # 
 PROGRESS_EVERY = 500
 
 
-async def main(database_url: str, apply: bool, max_drift_meters: float, limit: int | None) -> None:
+def _read_one(path: str, max_drift_meters: float) -> dict | None:
+    """在线程池里跑的部分：find_srt_sidecar本身也是阻塞的文件系统调用
+    (stat)，之前版本漏了没丢进线程池，相当于主事件循环也在等这个——这次
+    一起放进同一个线程任务里，配合外层的并发度控制。"""
+    srt_path = find_srt_sidecar(path)
+    if srt_path is None:
+        return None
+    return extract_srt_fields(path, max_drift_meters)
+
+
+async def main(
+    database_url: str, apply: bool, max_drift_meters: float, limit: int | None, concurrency: int
+) -> None:
     conn = await asyncpg.connect(database_url, server_settings={"search_path": "aerial,public"})
     try:
         query = "SELECT sha256, storage_path FROM videos WHERE deleted_at IS NULL ORDER BY sha256"
@@ -49,24 +70,31 @@ async def main(database_url: str, apply: bool, max_drift_meters: float, limit: i
         rows = await conn.fetch(query)
 
         total = len(rows)
-        print(f"待处理: {total} 条(deleted_at IS NULL的活记录，不限于字段缺失的)")
+        print(f"待处理: {total} 条(deleted_at IS NULL的活记录，不限于字段缺失的)，并发度={concurrency}")
         if total == 0:
             return
 
-        processed = no_srt = updated_gps = updated_height = updated_stability = 0
-        for row in rows:
-            processed += 1
-            sha256 = row["sha256"]
-            path = row["storage_path"]
+        semaphore = asyncio.Semaphore(concurrency)
+        done_count = 0
 
-            srt_path = find_srt_sidecar(path)
-            if srt_path is None:
+        async def process(row) -> tuple:
+            nonlocal done_count
+            async with semaphore:
+                fields = await asyncio.to_thread(_read_one, row["storage_path"], max_drift_meters)
+            done_count += 1
+            if done_count % PROGRESS_EVERY == 0:
+                print(f"[refresh_srt] 进度 {done_count}/{total}", flush=True)
+            return row["sha256"], fields
+
+        # gather一次性提交全部任务，靠Semaphore控制实际同时跑的数量，不是
+        # 分批提交——这样IO slot一空出来就立刻补下一个任务，吞吐量最大
+        results = await asyncio.gather(*(process(r) for r in rows))
+
+        no_srt = updated_gps = updated_height = updated_stability = 0
+        for sha256, fields in results:
+            if fields is None:
                 no_srt += 1
-                if processed % PROGRESS_EVERY == 0:
-                    print(f"[refresh_srt] 进度 {processed}/{total}", flush=True)
                 continue
-
-            fields = await asyncio.to_thread(extract_srt_fields, path, max_drift_meters)
             if fields["collect_lon"] is not None:
                 updated_gps += 1
             if fields["srt_height"] is not None:
@@ -89,9 +117,6 @@ async def main(database_url: str, apply: bool, max_drift_meters: float, limit: i
                     fields["srt_height"], fields["is_stable"],
                 )
 
-            if processed % PROGRESS_EVERY == 0:
-                print(f"[refresh_srt] 进度 {processed}/{total}", flush=True)
-
         print(
             f"\n完成: 共{total}条，没有sidecar SRT跳过(字段保持原值) {no_srt} 条；"
             f"{'已更新' if apply else '将更新(dry-run)'}: "
@@ -111,6 +136,10 @@ if __name__ == "__main__":
         help="is_stable判定用的最大位移阈值(米)，要跟.env里AERIAL_FLIGHT_STABILITY_MAX_DRIFT_METERS一致，默认30",
     )
     parser.add_argument("--limit", type=int, default=None, help="本次最多处理几条，不传就不限制")
+    parser.add_argument(
+        "--concurrency", type=int, default=32,
+        help="同时读取SRT文件的并发数，NAS网络IO是瓶颈不是CPU，默认32，太慢可以调大，NAS扛不住就调小",
+    )
     parser.add_argument("--apply", action="store_true", help="不加这个参数只是dry-run(读文件但不写库)，确认没问题后加这个才真的写入")
     args = parser.parse_args()
-    asyncio.run(main(args.database_url, args.apply, args.max_drift_meters, args.limit))
+    asyncio.run(main(args.database_url, args.apply, args.max_drift_meters, args.limit, args.concurrency))
