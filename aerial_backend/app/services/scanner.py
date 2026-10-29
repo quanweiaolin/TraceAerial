@@ -291,7 +291,9 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
             # 技术元数据(时长/分辨率/帧率/编码/collected_at)+GPS：ffprobe只读文件头，
             # 不会像sha256那样耗时；但内部调subprocess仍是阻塞调用，同样丢线程池，
             # 不占用事件循环
-            new_fields = await asyncio.to_thread(extract_new_video_fields, path)
+            new_fields = await asyncio.to_thread(
+                extract_new_video_fields, path, settings.flight_stability_max_drift_meters
+            )
             video = Video(
                 sha256=digest,
                 sha1=sha1_digest,

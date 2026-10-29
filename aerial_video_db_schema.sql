@@ -73,6 +73,10 @@ CREATE TABLE videos (
     flight_height     INTEGER,                        -- 文件夹名里的标称飞行高度(米)
     srt_height        DOUBLE PRECISION,                -- SRT遥测实际高度(rel_alt)，老格式SRT永久为NULL
 
+    -- 2026-10-29加(见add_video_is_stable_column.sql)：SRT轨迹整体位移是否
+    -- 在阈值内；NULL=没有可用SRT轨迹(未知，不是False)
+    is_stable         BOOLEAN,
+
     remark            TEXT,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -91,6 +95,7 @@ CREATE UNIQUE INDEX idx_videos_storage_path_active
 CREATE INDEX idx_videos_collected_at ON videos(collected_at);
 CREATE INDEX idx_videos_device ON videos(device_id);
 CREATE INDEX idx_videos_city_site ON videos(city, site) WHERE site IS NOT NULL;
+CREATE INDEX idx_videos_is_stable ON videos(is_stable) WHERE is_stable = false;
 
 -- GPS聚类得到的地址注册表：只存地址标签+聚类时生效的阈值+创建时间，不存
 -- 中心点坐标——簇内全部成员坐标直接查videos表(city+site过滤)即可，不用

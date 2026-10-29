@@ -88,6 +88,12 @@ class Video(Base):
     site: Mapped[str | None] = mapped_column(Text)
     flight_height: Mapped[int | None]
     srt_height: Mapped[float | None]
+    # 2026-10-29加：SRT整段轨迹里任意两帧GPS+高度的总位移超过
+    # AERIAL_FLIGHT_STABILITY_MAX_DRIFT_METERS就是False——地址聚类假设
+    # 拍摄期间飞机基本停在同一点，位移太大这条视频的单点GPS可能不代表
+    # 真实拍摄位置。没有SRT/解析不出轨迹时是NULL(未知，不是True也不是
+    # False)，不是所有视频都能判定
+    is_stable: Mapped[bool | None] = mapped_column(Boolean)
     # 同一个storage_path上的视频被重新编码(比如瘦身转码)会产生新sha256；
     # 这个自引用字段指回被替代的旧sha256，旧记录靠deleted_at软删除下线，
     # 保留血缘方便追溯"这个位置的视频历史上有过哪些版本"。见scanner.py处理逻辑。

@@ -21,6 +21,8 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
+from app.services.geo import trajectory_diameter_meters
+
 
 def probe_video(path: str | Path) -> dict:
     """用ffprobe读取视频技术元数据。
@@ -109,9 +111,54 @@ _GPS_FUNC_PATTERN = re.compile(r"GPS\(\s*(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)\s*,")
 # 对老格式视频永久是None，不是bug，等拿到老格式真机样本确认了再补
 _REL_ALT_PATTERN = re.compile(r"\[rel_alt\s*:\s*(-?\d+\.?\d*)")
 
+# 跟_GPS_KV_PATTERN/_REL_ALT_PATTERN分开独立匹配不同：这个要求经纬度+
+# rel_alt在同一帧(同一行)里绑在一起，给飞行稳定性判定(is_stable)专用——
+# 判定"整段飞行有没有明显移动"需要同一帧的位置和高度对应起来，不能像
+# 代表性坐标/高度那样经纬度和高度分别独立取中位数。中间允许隔着iso/
+# shutter等其它字段(.*?不跨行，不会误吃到下一帧的数据)
+_TRAJECTORY_KV_PATTERN = re.compile(
+    r"\[latitude\s*:\s*(-?\d+\.?\d*)\]\s*\[longitude\s*:\s*(-?\d+\.?\d*)\].*?"
+    r"\[rel_alt\s*:\s*(-?\d+\.?\d*)"
+)
 
-def extract_new_video_fields(path: str | Path) -> dict:
-    """整合probe_video + GPS提取，返回能直接拆包进Video(...)/UPDATE的字段dict。
+
+def extract_srt_fields(path: str | Path, max_drift_meters: float) -> dict:
+    """只做SRT相关的提取(经纬度/高度/飞行稳定性)，不碰probe_video的ffprobe
+    调用——专门给"只想快速刷新这几个字段，不想为了技术元数据重新读一遍
+    整个视频文件头"的场景用(比如scripts/refresh_srt_fields.py，ffprobe
+    在NAS上对几万条视频逐个起子进程很慢，但SRT只是个小文本文件，读取
+    成本低得多)。extract_new_video_fields内部也是调这个，两处共用一份
+    逻辑，不重复维护。
+
+    max_drift_meters: 判定is_stable用的最大位移阈值(米)，调用方自己决定
+    从哪里拿这个值(scanner.py/backfill.py从app.config.settings读，独立
+    脚本走CLI参数)——这个模块本身不依赖app.config，保持可以脱离.env
+    独立运行。
+    """
+    collect_lon = collect_lat = None
+    srt_height = None
+    is_stable = None
+    srt_path = find_srt_sidecar(path)
+    if srt_path is not None:
+        gps = extract_gps_from_srt(srt_path)
+        if gps is not None:
+            collect_lon, collect_lat = gps
+        srt_height = extract_rel_alt_from_srt(srt_path)
+        trajectory = extract_srt_trajectory(srt_path)
+        if trajectory is not None:
+            is_stable = trajectory_diameter_meters(trajectory) <= max_drift_meters
+
+    return {
+        "collect_lon": collect_lon,
+        "collect_lat": collect_lat,
+        "srt_height": srt_height,
+        "is_stable": is_stable,
+    }
+
+
+def extract_new_video_fields(path: str | Path, max_drift_meters: float = 30.0) -> dict:
+    """整合probe_video + SRT提取(extract_srt_fields)，返回能直接拆包进
+    Video(...)/UPDATE的字段dict。
 
     新视频入库(scanner.py)和给老视频补字段的回填脚本(services/backfill.py)
     共用这一个函数，避免两处重复维护同一套提取逻辑。
@@ -122,16 +169,6 @@ def extract_new_video_fields(path: str | Path) -> dict:
         Path(path).stat().st_mtime, tz=timezone.utc
     )
 
-    # GPS+高度：同名.srt存在就尝试解析，解析不出来(没有srt/格式不认识)保持None
-    collect_lon = collect_lat = None
-    srt_height = None
-    srt_path = find_srt_sidecar(path)
-    if srt_path is not None:
-        gps = extract_gps_from_srt(srt_path)
-        if gps is not None:
-            collect_lon, collect_lat = gps
-        srt_height = extract_rel_alt_from_srt(srt_path)
-
     return {
         "duration_seconds": meta["duration_seconds"],
         "width": meta["width"],
@@ -139,9 +176,7 @@ def extract_new_video_fields(path: str | Path) -> dict:
         "fps": meta["fps"],
         "codec": meta["codec"],
         "collected_at": collected_at,
-        "collect_lon": collect_lon,
-        "collect_lat": collect_lat,
-        "srt_height": srt_height,
+        **extract_srt_fields(path, max_drift_meters),
     }
 
 
@@ -191,10 +226,6 @@ def extract_rel_alt_from_srt(srt_path: str | Path) -> float | None:
     那次实际案例)。爬升/下降阶段只占整段视频一小部分，中位数能自然滤掉
     这种首尾瞬态值。
 
-    (collect_lon/collect_lat目前仍是取第一条GPS记录，理论上有类似风险，
-    但那是这次改动之前就有的老逻辑、影响面更广，这里先不动，只改这次
-    新加的srt_height)
-
     返回值对应 videos.srt_height；只认新格式的rel_alt标签，解析不出来
     (没有srt/是老格式/字段缺失)时返回None。"""
     try:
@@ -206,3 +237,23 @@ def extract_rel_alt_from_srt(srt_path: str | Path) -> float | None:
     if not matches:
         return None
     return statistics.median(float(v) for v in matches)
+
+
+def extract_srt_trajectory(srt_path: str | Path) -> list[tuple[float, float, float]] | None:
+    """解析整段SRT里每一帧的(lon, lat, rel_alt)三元组——跟extract_gps_from_srt/
+    extract_rel_alt_from_srt分别独立取中位数不同，这里同一帧的坐标和高度
+    绑在一起，保留"同一时刻"的对应关系，给is_stable(判定整段飞行有没有
+    明显移动，见app.services.geo.trajectory_diameter_meters)专用。
+
+    只支持新格式(带rel_alt的KV格式)；老格式没有解析过rel_alt，解析不出来
+    (没有srt/是老格式/一帧都凑不出完整的latitude+longitude+rel_alt三元组)
+    时返回None，is_stable对这些视频永久是None(未知)，不是False。"""
+    try:
+        text = Path(srt_path).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+
+    matches = _TRAJECTORY_KV_PATTERN.findall(text)
+    if not matches:
+        return None
+    return [(float(lon_str), float(lat_str), float(alt_str)) for lat_str, lon_str, alt_str in matches]

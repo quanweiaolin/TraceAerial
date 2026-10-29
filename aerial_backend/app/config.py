@@ -52,5 +52,11 @@ class Settings(BaseSettings):
     # videos.site(locations表记录了当时生效的阈值，供追溯)
     address_cluster_max_diameter_meters: float = 20.0
 
+    # 飞行稳定性：单个视频自己的SRT轨迹里，任意两帧的GPS+高度总位移超过
+    # 这个值(米)就判定is_stable=False——这组视频假设拍摄期间飞机基本停在
+    # 同一个点(地址聚类/下游SIFT对齐都依赖这个假设)，位移太大说明飘了/
+    # 飞手手动飞去了别的地方，这条视频的单点GPS/地址可能不准
+    flight_stability_max_drift_meters: float = 30.0
+
 
 settings = Settings()

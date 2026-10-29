@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
+from scipy.spatial.distance import pdist
+
 EARTH_RADIUS_METERS = 6371000.0
 
 
@@ -34,3 +37,19 @@ def distance_3d_meters(
     horizontal = math.hypot(x, y)
     vertical = height1 - height2
     return math.hypot(horizontal, vertical)
+
+
+def trajectory_diameter_meters(points: list[tuple[float, float, float]]) -> float:
+    """给定一串(lon, lat, height)点(比如一段视频SRT里逐帧的轨迹)，算它们
+    两两之间的最大距离(米)——用于判断飞行稳定性(see scanner.py的is_stable
+    判定：单个视频自己的轨迹如果整体移动超过阈值，说明拍摄期间飞机飘了/
+    飞去了别的地方)。用scipy.spatial.distance.pdist(C实现)算，不是手写
+    O(n^2)双重循环，几千个点内一瞬间出结果。"""
+    if len(points) < 2:
+        return 0.0
+    ref_lon, ref_lat, ref_height = points[0]
+    coords = np.array([
+        [*latlon_to_local_meters(lon, lat, ref_lon, ref_lat), height - ref_height]
+        for lon, lat, height in points
+    ])
+    return float(pdist(coords).max())
