@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+import statistics
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -171,8 +172,19 @@ def extract_gps_from_srt(srt_path: str | Path) -> tuple[float, float] | None:
 
 
 def extract_rel_alt_from_srt(srt_path: str | Path) -> float | None:
-    """从SRT遥测字幕里提取一个代表性飞行高度(取第一条能解析出来的rel_alt，
-    跟extract_gps_from_srt取第一条GPS记录是同一个思路)。
+    """从SRT遥测字幕里提取一个代表性飞行高度：取全程所有能解析出来的rel_alt
+    读数的中位数，不是只取第一条。
+
+    2026-10-29地址聚类backfill跑出来的真实数据发现过"取第一条"的问题：
+    起飞爬升阶段还没到巡航高度时录的SRT，第一条rel_alt可能只有10米量级，
+    跟同地点其他视频普遍119-120米差一大截，把这个瞬时值当成整段视频的
+    代表高度会直接导致聚类判断错误(南宁xiuxiangavenueqingxiangexpressway
+    那次实际案例)。爬升/下降阶段只占整段视频一小部分，中位数能自然滤掉
+    这种首尾瞬态值。
+
+    (collect_lon/collect_lat目前仍是取第一条GPS记录，理论上有类似风险，
+    但那是这次改动之前就有的老逻辑、影响面更广，这里先不动，只改这次
+    新加的srt_height)
 
     返回值对应 videos.srt_height；只认新格式的rel_alt标签，解析不出来
     (没有srt/是老格式/字段缺失)时返回None。"""
@@ -181,8 +193,7 @@ def extract_rel_alt_from_srt(srt_path: str | Path) -> float | None:
     except OSError:
         return None
 
-    match = _REL_ALT_PATTERN.search(text)
-    if match:
-        return float(match.group(1))
-
-    return None
+    matches = _REL_ALT_PATTERN.findall(text)
+    if not matches:
+        return None
+    return statistics.median(float(v) for v in matches)
