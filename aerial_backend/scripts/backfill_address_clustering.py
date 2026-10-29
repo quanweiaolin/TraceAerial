@@ -28,19 +28,34 @@ _assign_city_site(领导者算法，只新增不改动已有分配)。这两个�
 不符合命名规范/没有GPS坐标(collect_lon/lat为空)的视频不受影响，city/
 site/flight_height/srt_height永久留空，这是预期行为，不是bug。
 
+2026-10-29生产端实跑发现：有些"单成员地址"的height中位数远低于标称值
+(比如3.2m vs标称80m)，排查发现是这条视频自己的SRT轨迹本身就从起飞点
+一路爬升到巡航高度甚至更高(比如这次真实案例：4795帧，高度范围从-2.5m
+到101.3m)，median只是把"整段飞行"的中间值取出来，不代表任何有意义的
+单点位置——这种视频不该参与聚类(不该用一个不代表真实拍摄位置的中位数
+点去建一个新地址)。用is_stable(轨迹内最大位移<=AERIAL_FLIGHT_STABILITY_
+MAX_DRIFT_METERS，见app.services.geo.trajectory_diameter_meters)过滤：
+is_stable为False的视频不参与聚类，跟没有GPS坐标一样只补city/flight_
+height/srt_height/collect_lon/collect_lat/is_stable这几个字段，site
+留空。is_stable是None(没有可用轨迹，比如老格式SRT)的视频仍然正常参与
+聚类——没有证据说它不稳定，不能当成"不稳定"处理。
+
 幂等/可续跑：按`site IS NULL`筛选候选行，已经成功分配过地址的不会重新
-处理；没有GPS坐标的视频每次重跑都会被重新尝试一次(代价很小，几千条
-量级无所谓)。
+处理；没有GPS坐标/is_stable=False被排除在聚类外的视频，site一直是NULL，
+每次重跑都会被重新尝试一次(代价很小，几千条量级无所谓；如果SRT本身没变，
+重跑结果也不会变，不是bug)。
 
 用法：
     uv run python aerial_backend/scripts/backfill_address_clustering.py \
         --database-url postgresql://user:pass@localhost:5432/aerial_db \
-        --threshold-meters 20
+        --threshold-meters 20 --max-drift-meters 30
     # 不加--apply是dry-run：会把每个city分出几个簇、每个簇的成员数、簇内
     # 最大两两距离都打印出来，先确认这些数字看起来合理，再加--apply正式写。
-    # --threshold-meters要跟.env里AERIAL_ADDRESS_CLUSTER_MAX_DIAMETER_METERS
-    # 保持一致(默认20)，这里单独传参是为了这个脚本不依赖app.config/.env，
-    # 避免cwd不对导致.env读不到的问题(跟backfill_video_sha1.py同样的考虑)。
+    # --threshold-meters要跟.env里AERIAL_ADDRESS_CLUSTER_MAX_DIAMETER_METERS、
+    # --max-drift-meters要跟AERIAL_FLIGHT_STABILITY_MAX_DRIFT_METERS保持
+    # 一致(默认分别是20/30)，这里单独传参是为了这个脚本不依赖app.config/
+    # .env，避免cwd不对导致.env读不到的问题(跟backfill_video_sha1.py同样
+    # 的考虑)。
 """
 from __future__ import annotations
 
@@ -66,7 +81,10 @@ PROGRESS_EVERY = 200
 
 
 class VideoRow:
-    __slots__ = ("sha256", "storage_path", "city", "raw_site", "flight_height", "srt_height", "lon", "lat")
+    __slots__ = (
+        "sha256", "storage_path", "city", "raw_site", "flight_height", "srt_height", "lon", "lat",
+        "is_stable", "trajectory_diameter", "trajectory_height_min", "trajectory_height_max",
+    )
 
     def __init__(self, sha256, storage_path, lon, lat):
         self.sha256 = sha256
@@ -77,6 +95,10 @@ class VideoRow:
         self.raw_site = None
         self.flight_height = None
         self.srt_height = None
+        self.is_stable = None
+        self.trajectory_diameter = None
+        self.trajectory_height_min = None
+        self.trajectory_height_max = None
 
 
 def _height_of(row: VideoRow) -> float:
@@ -140,20 +162,16 @@ def _diagnose_small_cluster(members: list[VideoRow], all_rows: list[VideoRow], t
             f"height={_height_of(m):.1f}({height_source}) "
             f"srt_height={m.srt_height} flight_height={m.flight_height}"
         )
-        # 轨迹诊断：区分"整段视频全程都在这个高度(可能是一次降落/起飞段的
-        # 独立文件，比如DJI按时长自动切片，最后一段整段都在降落)"还是
-        # "视频内部本身就从高到低/低到高有个过渡"——srt_height中位数已经
-        # 滤掉了开头/结尾的瞬态，如果这里diameter还是很大，说明不是瞬态，
-        # 是这条视频本身大半程都在明显移动/变高度
-        srt_path = find_srt_sidecar(m.storage_path)
-        trajectory = extract_srt_trajectory(srt_path) if srt_path is not None else None
-        if trajectory is not None and len(trajectory) >= 2:
-            heights = [h for _, _, h in trajectory]
-            diameter = trajectory_diameter_meters(trajectory)
+        # 轨迹诊断：用主循环里已经算好并缓存在row上的is_stable/trajectory_*，
+        # 不重新读一遍SRT——is_stable为False的视频现在已经被主流程排除在
+        # 聚类之外(不会出现在这里的members里)，这个分支理论上只会打印"内部
+        # 基本稳定"，留着是给is_stable为None(没有可用轨迹)的情况也能看到
+        # 诊断信息
+        if m.trajectory_diameter is not None:
             print(
-                f"          自身轨迹: {len(trajectory)}帧，高度范围[{min(heights):.1f}, {max(heights):.1f}]，"
-                f"轨迹内最大位移={diameter:.2f}m"
-                + (" ⚠️ 视频内部本身就有明显移动/高度变化" if diameter > 30 else "(内部基本稳定)")
+                f"          自身轨迹: 高度范围[{m.trajectory_height_min:.1f}, {m.trajectory_height_max:.1f}]，"
+                f"轨迹内最大位移={m.trajectory_diameter:.2f}m"
+                + (" ⚠️ 视频内部本身就有明显移动/高度变化" if m.is_stable is False else "(内部基本稳定)")
             )
         nearest = _nearest_other(m, all_rows)
         if nearest is None:
@@ -175,7 +193,7 @@ def _diagnose_small_cluster(members: list[VideoRow], all_rows: list[VideoRow], t
         )
 
 
-async def main(database_url: str, apply: bool, threshold_meters: float) -> None:
+async def main(database_url: str, apply: bool, threshold_meters: float, max_drift_meters: float) -> None:
     conn = await asyncpg.connect(database_url, server_settings={"search_path": "aerial,public"})
     try:
         rows_raw = await conn.fetch(
@@ -186,8 +204,12 @@ async def main(database_url: str, apply: bool, threshold_meters: float) -> None:
 
         matched = 0
         no_gps = 0
+        unstable = 0
         by_city: dict[str, list[VideoRow]] = defaultdict(list)
-        text_only_updates: list[VideoRow] = []  # 符合命名规范但没有GPS，只补文本字段
+        # 符合命名规范但没有GPS，或者有GPS但自身轨迹不稳定(is_stable=False)——
+        # 两种都不参与聚类，只补文本字段+已经重新解析出来的collect_lon/lat/
+        # srt_height/is_stable
+        excluded_from_clustering: list[VideoRow] = []
 
         for processed, r in enumerate(rows_raw, start=1):
             match = find_session_match(r["storage_path"])
@@ -217,9 +239,20 @@ async def main(database_url: str, apply: bool, threshold_meters: float) -> None:
                     row.lon, row.lat = gps
                 row.srt_height = extract_rel_alt_from_srt(srt_path)
 
+                trajectory = extract_srt_trajectory(srt_path)
+                if trajectory is not None and len(trajectory) >= 2:
+                    heights = [h for _, _, h in trajectory]
+                    row.trajectory_diameter = trajectory_diameter_meters(trajectory)
+                    row.trajectory_height_min = min(heights)
+                    row.trajectory_height_max = max(heights)
+                    row.is_stable = row.trajectory_diameter <= max_drift_meters
+
             if row.lon is None or row.lat is None:
                 no_gps += 1
-                text_only_updates.append(row)
+                excluded_from_clustering.append(row)
+            elif row.is_stable is False:
+                unstable += 1
+                excluded_from_clustering.append(row)
             else:
                 by_city[row.city].append(row)
 
@@ -228,9 +261,10 @@ async def main(database_url: str, apply: bool, threshold_meters: float) -> None:
 
         print(
             f"\n符合会话命名规范: {matched}/{len(rows_raw)}；"
-            f"其中没有GPS坐标(不参与聚类，只补city/flight_height/srt_height): {no_gps}"
+            f"其中没有GPS坐标: {no_gps}，自身轨迹不稳定(is_stable=False): {unstable}"
+            f"(这两类都不参与聚类，只补city/flight_height/srt_height/collect_lon/lat/is_stable)"
         )
-        print(f"符合规范+有GPS、将参与聚类的city数: {len(by_city)}\n")
+        print(f"符合规范+有GPS+稳定、将参与聚类的city数: {len(by_city)}\n")
 
         # (city, raw_site前缀) -> 下一个可用序号；先用这个city下已有的locations
         # 占位，保证序号不跟locations表里已经存在的地址冲突(虽然site IS NULL
@@ -246,7 +280,9 @@ async def main(database_url: str, apply: bool, threshold_meters: float) -> None:
 
         total_clusters = 0
         location_inserts: list[tuple[str, str, float]] = []
-        video_updates: list[tuple[bytes, str, str | None, int, float | None, float | None, float | None]] = []
+        video_updates: list[
+            tuple[bytes, str, str | None, int, float | None, float | None, float | None, bool | None]
+        ] = []
 
         for city, rows in sorted(by_city.items()):
             clusters = _cluster_one_city(city, rows, threshold_meters)
@@ -268,12 +304,12 @@ async def main(database_url: str, apply: bool, threshold_meters: float) -> None:
                 location_inserts.append((city, site_label, threshold_meters))
                 for m in members:
                     video_updates.append(
-                        (m.sha256, city, site_label, m.flight_height, m.srt_height, m.lon, m.lat)
+                        (m.sha256, city, site_label, m.flight_height, m.srt_height, m.lon, m.lat, m.is_stable)
                     )
 
-        for row in text_only_updates:
+        for row in excluded_from_clustering:
             video_updates.append(
-                (row.sha256, row.city, None, row.flight_height, row.srt_height, row.lon, row.lat)
+                (row.sha256, row.city, None, row.flight_height, row.srt_height, row.lon, row.lat, row.is_stable)
             )
 
         print(f"\n共{total_clusters}个新地址，{len(video_updates)}条视频记录将被更新")
@@ -286,11 +322,11 @@ async def main(database_url: str, apply: bool, threshold_meters: float) -> None:
                         "ON CONFLICT (city, site) DO NOTHING",
                         city, site, thr,
                     )
-                for sha256, city, site, flight_height, srt_height, lon, lat in video_updates:
+                for sha256, city, site, flight_height, srt_height, lon, lat, is_stable in video_updates:
                     await conn.execute(
                         "UPDATE videos SET city = $2, site = $3, flight_height = $4, srt_height = $5, "
-                        "collect_lon = $6, collect_lat = $7 WHERE sha256 = $1",
-                        sha256, city, site, flight_height, srt_height, lon, lat,
+                        "collect_lon = $6, collect_lat = $7, is_stable = $8 WHERE sha256 = $1",
+                        sha256, city, site, flight_height, srt_height, lon, lat, is_stable,
                     )
             print("已写入数据库(--apply)")
         else:
@@ -306,6 +342,10 @@ if __name__ == "__main__":
         "--threshold-meters", type=float, default=20.0,
         help="簇内最大两两距离(米)，要跟.env里AERIAL_ADDRESS_CLUSTER_MAX_DIAMETER_METERS一致，默认20",
     )
+    parser.add_argument(
+        "--max-drift-meters", type=float, default=30.0,
+        help="is_stable判定用的最大位移阈值(米)，要跟.env里AERIAL_FLIGHT_STABILITY_MAX_DRIFT_METERS一致，默认30",
+    )
     parser.add_argument("--apply", action="store_true", help="不加这个参数只是dry-run，确认没问题后加这个才真的写入")
     args = parser.parse_args()
-    asyncio.run(main(args.database_url, args.apply, args.threshold_meters))
+    asyncio.run(main(args.database_url, args.apply, args.threshold_meters, args.max_drift_meters))
