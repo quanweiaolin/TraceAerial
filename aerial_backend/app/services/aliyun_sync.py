@@ -80,6 +80,13 @@ from pds_sync.core import (  # noqa: E402  (必须在sys.path插入之后才能i
 )
 
 PREFIX_ALIYUN = "【阿里云下载】"  # 2026-10-28起，这个模块发的飞书消息统一加这个前缀
+ALIYUN_SCAN_INTERVAL_HOURS = 6  # scheduled_aliyun_scan的心跳间隔，跟main.py注册
+# 这个定时任务时传的interval hours保持同一个值(main.py直接import这个常量用，
+# 不要在那边另外写死一个6)。"判定完成后静默多久才算真稳定"这个计算
+# (settings.aliyun_stability_scans_required * 这个值)依赖这俩数字是同一个
+# 真实在跑的心跳节奏，不是两份互相不知道对方的硬编码(2026-10-28教训：
+# 一开始给"哪些文件夹可以开始"那个查询写死了"10 days"字面量，改心跳配置
+# 容易忘记同步，后来改成直接算这两个值，不再有写死的数字)
 
 
 def _cli_binary_path() -> Path:

@@ -14,10 +14,10 @@ from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
 
-from app.api.routers import videos
+from app.api.routers import aliyun_status, videos
 from app.config import settings
 from app.db import SessionContext
-from app.services.aliyun_sync import run_aliyun_scan
+from app.services.aliyun_sync import ALIYUN_SCAN_INTERVAL_HOURS, run_aliyun_scan
 from app.services.backfill import backfill_video_metadata
 from app.services.notifier import process_pending_notifications, send_daily_summary
 from app.services.scanner import run_scan
@@ -69,7 +69,10 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(
         scheduled_metadata_backfill, "cron", hour=8, minute=45, id="metadata_backfill"
     )
-    scheduler.add_job(scheduled_aliyun_scan, "interval", hours=6, id="aliyun_scan", next_run_time=now)
+    scheduler.add_job(
+        scheduled_aliyun_scan, "interval", hours=ALIYUN_SCAN_INTERVAL_HOURS,
+        id="aliyun_scan", next_run_time=now,
+    )
     scheduler.start()
     yield
     scheduler.shutdown()
@@ -77,6 +80,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Aerial Video Data Management", lifespan=lifespan)
 app.include_router(videos.router)
+app.include_router(aliyun_status.router)
 
 
 @app.post("/scan/trigger")
