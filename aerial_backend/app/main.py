@@ -7,6 +7,9 @@
       3) 每天一次的数据库汇总(新增视频数/短视频/缺经纬度)
       4) 每天一次的元数据补全(duration/GPS缺失的视频重新提取一遍，主要用来
          补"扫盘时SRT文件还没复制完"导致的GPS缺失)
+      5) 每周一次的本地文件完整性检查(videos表活记录对应的本地文件是不是
+         真的还在，不限于走阿里云同步进来的那部分；发现缺失只按文件夹粒度
+         报一条飞书，不自动修复)
 """
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -20,7 +23,7 @@ from app.db import SessionContext
 from app.services.aliyun_sync import ALIYUN_SCAN_INTERVAL_HOURS, run_aliyun_scan
 from app.services.backfill import backfill_video_metadata
 from app.services.notifier import process_pending_notifications, send_daily_summary
-from app.services.scanner import run_scan
+from app.services.scanner import check_local_file_integrity, run_scan
 
 scheduler = AsyncIOScheduler()
 
@@ -53,6 +56,11 @@ async def scheduled_metadata_backfill() -> None:
         await backfill_video_metadata(session, only_missing=True)
 
 
+async def scheduled_check_missing_files() -> None:
+    async with SessionContext() as session:
+        await check_local_file_integrity(session)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # interval任务默认第一次触发时间是"现在+间隔"，不是启动后马上跑——
@@ -73,6 +81,10 @@ async def lifespan(app: FastAPI):
         scheduled_aliyun_scan, "interval", hours=ALIYUN_SCAN_INTERVAL_HOURS,
         id="aliyun_scan", next_run_time=now,
     )
+    # 每周检查一次本地文件完整性(videos表活记录对应的文件是不是真的还在磁盘
+    # 上)，不需要next_run_time=now立刻跑——这是低紧迫度的周期健康检查，
+    # 不是"有变化要立刻处理"那类任务，没必要在每次服务重启时都额外跑一次
+    scheduler.add_job(scheduled_check_missing_files, "interval", weeks=1, id="check_missing_files")
     scheduler.start()
     yield
     scheduler.shutdown()

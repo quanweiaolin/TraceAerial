@@ -42,6 +42,7 @@ from app.config import settings
 from app.models import Device, Location, Notification, Operator, ScanDiscovery, ScanJob, Video
 from app.services.geo import distance_3d_meters
 from app.services.hashing import compute_sha256_and_sha1
+from app.services.notifier import send_feishu_message
 from app.services.session_naming import find_session_match
 from app.services.video_metadata import extract_new_video_fields
 
@@ -483,3 +484,47 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
         flush=True,
     )
     return job
+
+
+async def check_local_file_integrity(session: AsyncSession) -> None:
+    """定期健康检查(建议每周跑一次，见app/main.py的调度注册)：扫一遍videos
+    表里deleted_at IS NULL的活记录，检查storage_path对应的文件是不是还
+    真的存在。只检测、只报警，不碰任何下载/重新扫描/写库操作——这类问题
+    之前只能靠巧合发现(2026-10-29：backfill_video_sha1.py重新读文件时
+    碰巧撞上FileNotFoundError才发现一个session丢了36个文件)，而且只覆盖
+    走阿里云同步这条路径进来、还在被心跳监控的那一部分视频；这里做成
+    全系统统一的检查，不限制来源，也不要求文件夹还在被别的地方监控。
+
+    按"文件夹"(storage_path的直接父目录)粒度汇总成一条飞书消息，不是
+    每个缺失文件单独发一条——一个文件夹丢了几十个文件只应该报一条，
+    不刷屏。"""
+    result = await session.execute(select(Video.storage_path).where(Video.deleted_at.is_(None)))
+    paths = [row[0] for row in result.all()]
+
+    semaphore = asyncio.Semaphore(32)
+
+    async def _exists(path: str) -> bool:
+        async with semaphore:
+            return await asyncio.to_thread(Path(path).is_file)
+
+    exists_flags = await asyncio.gather(*(_exists(p) for p in paths))
+
+    missing_by_folder: dict[str, int] = defaultdict(int)
+    for path, exists in zip(paths, exists_flags):
+        if not exists:
+            missing_by_folder[str(Path(path).parent)] += 1
+
+    if not missing_by_folder:
+        print(f"[check_missing] 本地文件完整性检查：共{len(paths)}条活记录，全部正常", flush=True)
+        return
+
+    total_missing = sum(missing_by_folder.values())
+    detail = "\n".join(f"  {folder}：缺失{count}个" for folder, count in sorted(missing_by_folder.items()))
+    print(
+        f"[check_missing] 发现{total_missing}个文件缺失，涉及{len(missing_by_folder)}个文件夹：\n{detail}",
+        flush=True,
+    )
+    await send_feishu_message(
+        f"【本地文件检查】🚨 发现{total_missing}个已登记视频的本地文件缺失，"
+        f"涉及{len(missing_by_folder)}个文件夹：\n{detail}"
+    )
