@@ -44,6 +44,20 @@ CREATE TABLE devices (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- GPS聚类得到的地址注册表：只存地址标签+聚类时生效的阈值+创建时间，不存
+-- 中心点坐标——簇内全部成员坐标直接查videos表(location_id过滤)即可，不用
+-- 重复存一份。放在videos表之前定义，因为videos.location_id要引用它。
+-- 见add_video_address_clustering.sql / add_video_location_id_column.sql
+CREATE TABLE locations (
+    id               BIGSERIAL PRIMARY KEY,
+    city             TEXT NOT NULL,
+    site             TEXT NOT NULL,
+    threshold_meters DOUBLE PRECISION NOT NULL,       -- 这个地址诞生时生效的最大簇内距离(米)
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (city, site)
+);
+COMMENT ON TABLE locations IS 'GPS聚类得到的地址注册表，不存中心点坐标，簇内全部成员坐标直接查videos表(location_id)';
+
 -- ============================================================
 -- 1. 核心主表：视频
 -- ============================================================
@@ -69,7 +83,9 @@ CREATE TABLE videos (
     -- 2026-10-29加(见add_video_address_clustering.sql)：地址聚类，给下游
     -- 多视频SIFT对齐/稳像用。只有storage_path符合会话命名规范的视频才有值
     city              TEXT,                           -- 采集地点城市，从storage_path解析
-    site              TEXT,                           -- GPS聚类后的最终地址标签(如panshiroad_1)，一旦分配不可再改
+    -- 2026-10-30改：不再直接存地址标签文本，改存外键(见
+    -- add_video_location_id_column.sql)，一旦分配不可再改
+    location_id       BIGINT REFERENCES locations(id),
     flight_height     INTEGER,                        -- 文件夹名里的标称飞行高度(米)
     srt_height        DOUBLE PRECISION,                -- SRT遥测实际高度(rel_alt)，老格式SRT永久为NULL
 
@@ -94,21 +110,8 @@ CREATE UNIQUE INDEX idx_videos_storage_path_active
 
 CREATE INDEX idx_videos_collected_at ON videos(collected_at);
 CREATE INDEX idx_videos_device ON videos(device_id);
-CREATE INDEX idx_videos_city_site ON videos(city, site) WHERE site IS NOT NULL;
+CREATE INDEX idx_videos_location_id ON videos(location_id) WHERE location_id IS NOT NULL;
 CREATE INDEX idx_videos_is_stable ON videos(is_stable) WHERE is_stable = false;
-
--- GPS聚类得到的地址注册表：只存地址标签+聚类时生效的阈值+创建时间，不存
--- 中心点坐标——簇内全部成员坐标直接查videos表(city+site过滤)即可，不用
--- 重复存一份。见add_video_address_clustering.sql
-CREATE TABLE locations (
-    id               BIGSERIAL PRIMARY KEY,
-    city             TEXT NOT NULL,
-    site             TEXT NOT NULL,
-    threshold_meters DOUBLE PRECISION NOT NULL,       -- 这个地址诞生时生效的最大簇内距离(米)
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (city, site)
-);
-COMMENT ON TABLE locations IS 'GPS聚类得到的地址注册表，不存中心点坐标，簇内全部成员坐标直接查videos表(city+site)';
 
 -- ============================================================
 -- 2. 流水线进度跟踪（核心：可扩展 + 展示每个视频的进展）

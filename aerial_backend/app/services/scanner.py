@@ -97,9 +97,9 @@ def _folder_root(path_str: str) -> str:
 async def _apply_session_metadata(session: AsyncSession, video: Video, storage_path: Path) -> None:
     """从storage_path里找"飞行会话文件夹"命名规范的那一段(City_Site_Drone_
     Height_Person_Date)，补上device_id/collected_by/city/flight_height，
-    并尝试给这个视频分配地址(site，见_assign_city_site)。找不到就什么都
-    不做——不是所有视频都来自这套命名规范(比如历史数据/其他来源)，这是
-    尽力而为的补全，不是强制要求。"""
+    并尝试给这个视频分配地址(location_id，见_assign_city_site)。找不到就
+    什么都不做——不是所有视频都来自这套命名规范(比如历史数据/其他来源)，
+    这是尽力而为的补全，不是强制要求。"""
     match = find_session_match(storage_path)
     if match is None:
         return
@@ -117,28 +117,31 @@ async def _assign_city_site(
     按locations表里这个city下已有的全部地址，逐个检查新点跟该地址下videos
     表里现有全部成员(不是只跟某个中心点比)的三维距离，要求全部<=阈值才算
     可以加入——locations表本身只存地址标签+阈值+创建时间，不单独存成员
-    坐标，"簇内全部成员"直接就是videos表里已经打了这个(city, site)标签的
-    记录，省一份重复存储，也不会因为两份数据不同步出问题。
+    坐标，"簇内全部成员"直接就是videos表里location_id指向这个地址的记录，
+    省一份重复存储，也不会因为两份数据不同步出问题。
 
     候选地址范围是整个city下的全部已有地址，不限制必须跟这次视频文件夹
     自己写的site分段同名——物理聚类应该只看GPS位置，跟飞手文件夹怎么
     命名无关，site分段只用来给"新建的地址"取名字前缀。
 
-    没有GPS坐标(collect_lon/lat为空)的视频不参与聚类，video.site保持
-    NULL；地址一旦分配不会再改(调用方保证video是刚入库、site还是空的
-    新记录，不会对已有地址的视频重新判定)。"""
+    没有GPS坐标(collect_lon/lat为空)、或者自身飞行不稳定(is_stable为
+    False，SRT轨迹本身跨度太大、单点GPS不代表真实拍摄位置)的视频不参与
+    聚类，video.location_id保持NULL；地址一旦分配不会再改(调用方保证
+    video是刚入库、location_id还是空的新记录，不会对已有地址的视频重新
+    判定)。"""
     if video.collect_lon is None or video.collect_lat is None:
+        return
+    if video.is_stable is False:
         return
     height = video.srt_height if video.srt_height is not None else float(video.flight_height)
 
-    existing_sites_result = await session.execute(
-        select(Location.site).where(Location.city == city).order_by(Location.created_at)
+    existing_locations_result = await session.execute(
+        select(Location.id, Location.site).where(Location.city == city).order_by(Location.created_at)
     )
-    for (candidate_site,) in existing_sites_result:
+    for candidate_id, candidate_site in existing_locations_result:
         members_result = await session.execute(
             select(Video.collect_lon, Video.collect_lat, Video.srt_height, Video.flight_height)
-            .where(Video.city == city)
-            .where(Video.site == candidate_site)
+            .where(Video.location_id == candidate_id)
             .where(Video.deleted_at.is_(None))
         )
         members = members_result.all()
@@ -152,7 +155,7 @@ async def _assign_city_site(
             for m_lon, m_lat, m_srt_height, m_flight_height in members
         )
         if fits:
-            video.site = candidate_site
+            video.location_id = candidate_id
             return
 
     # 没有任何已有地址能装下这个新点，新建一个地址。命名"{raw_site}_{序号}"，
@@ -168,14 +171,14 @@ async def _assign_city_site(
         if label[len(raw_site) + 1:].isdigit()
     ]
     new_site = f"{raw_site}_{max(existing_indexes, default=0) + 1}"
-    session.add(
-        Location(
-            city=city,
-            site=new_site,
-            threshold_meters=settings.address_cluster_max_diameter_meters,
-        )
+    new_location = Location(
+        city=city,
+        site=new_site,
+        threshold_meters=settings.address_cluster_max_diameter_meters,
     )
-    video.site = new_site
+    session.add(new_location)
+    await session.flush()  # 拿到new_location.id
+    video.location_id = new_location.id
 
 
 async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:

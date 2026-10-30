@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     # 地址聚类(GPS+高度)：同一个地址(locations表一行)内任意两点最大距离(米)，
     # 下游要拿同地址的多个视频做SIFT对齐/稳像，20m是为了控制对齐后黑边大小
     # (2026-10-29敲定)。只影响新建地址的判定，改这个值不会动已经分配好的
-    # videos.site(locations表记录了当时生效的阈值，供追溯)
+    # videos.location_id(locations表记录了当时生效的阈值，供追溯)
     address_cluster_max_diameter_meters: float = 20.0
 
     # 飞行稳定性：单个视频自己的SRT轨迹里，任意两帧的GPS+高度总位移超过

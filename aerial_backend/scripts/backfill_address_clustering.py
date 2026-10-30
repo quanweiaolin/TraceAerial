@@ -1,8 +1,10 @@
 """一次性初始化脚本：给已入库的、storage_path符合会话命名规范(约5.2%)的
-历史视频补city/site/flight_height/srt_height，并用complete-linkage层次
-聚类(sklearn.cluster.AgglomerativeClustering, linkage='complete')把同一
-个city下GPS+高度相近的视频归到同一个"地址"，写进locations表、回填
-videos.site。
+历史视频补city/flight_height/srt_height，并用complete-linkage层次聚类
+(sklearn.cluster.AgglomerativeClustering, linkage='complete')把同一个
+city下GPS+高度相近的视频归到同一个"地址"，写进locations表、回填
+videos.location_id(2026-10-30起改成外键，不再直接存site文本，理由见
+app/models.py里Video.location_id字段注释：以后改地址标签名只用改
+locations一行，不用批量改videos)。
 
 2026-10-30起改成直接读DB里的collect_lon/collect_lat/srt_height/is_stable，
 不再自己重新解析SRT——这4个字段现在由scripts/refresh_srt_fields.py统一
@@ -23,7 +25,7 @@ _assign_city_site(领导者算法，只新增不改动已有分配)。这两个�
 是2026-10-29设计讨论敲定的，不要混用。
 
 不符合命名规范/没有GPS坐标(collect_lon/lat为空)的视频不受影响，city/
-site/flight_height/srt_height永久留空，这是预期行为，不是bug。
+location_id/flight_height/srt_height永久留空，这是预期行为，不是bug。
 
 2026-10-29生产端实跑发现：有些"单成员地址"的height中位数远低于标称值
 (比如3.2m vs标称80m)，排查发现是这条视频自己的SRT轨迹本身就从起飞点
@@ -33,16 +35,16 @@ site/flight_height/srt_height永久留空，这是预期行为，不是bug。
 点去建一个新地址)。用DB里的is_stable过滤：is_stable为False的视频不
 参与聚类，跟没有GPS坐标一样只补city/flight_height这几个字段(srt_height/
 collect_lon/collect_lat/is_stable已经是refresh_srt_fields.py写好的，
-这里不用再写)，site留空。is_stable是None(没有可用轨迹，比如老格式SRT)
+这里不用再写)，location_id留空。is_stable是None(没有可用轨迹，比如老格式SRT)
 的视频仍然正常参与聚类——没有证据说它不稳定，不能当成"不稳定"处理。
 诊断小簇时(_diagnose_small_cluster)会按需重新读一下SRT算轨迹细节(高度
 范围/内部最大位移)用于人工排查展示，不影响聚类决策本身(决策只认DB里
 的is_stable)。
 
-幂等/可续跑：按`site IS NULL`筛选候选行，已经成功分配过地址的不会重新
-处理；没有GPS坐标/is_stable=False被排除在聚类外的视频，site一直是NULL，
-每次重跑都会被重新尝试一次(代价很小，几千条量级无所谓；如果SRT本身没变，
-重跑结果也不会变，不是bug)。
+幂等/可续跑：按`location_id IS NULL`筛选候选行，已经成功分配过地址的
+不会重新处理；没有GPS坐标/is_stable=False被排除在聚类外的视频，
+location_id一直是NULL，每次重跑都会被重新尝试一次(代价很小，几千条
+量级无所谓；如果SRT本身没变，重跑结果也不会变，不是bug)。
 
 用法：
     uv run python aerial_backend/scripts/backfill_address_clustering.py \
@@ -195,9 +197,9 @@ async def main(database_url: str, apply: bool, threshold_meters: float, max_drif
     try:
         rows_raw = await conn.fetch(
             "SELECT sha256, storage_path, collect_lon, collect_lat, srt_height, is_stable FROM videos "
-            "WHERE deleted_at IS NULL AND site IS NULL ORDER BY sha256"
+            "WHERE deleted_at IS NULL AND location_id IS NULL ORDER BY sha256"
         )
-        print(f"待检查: {len(rows_raw)} 条(deleted_at IS NULL且site IS NULL的活记录)")
+        print(f"待检查: {len(rows_raw)} 条(deleted_at IS NULL且location_id IS NULL的活记录)")
 
         matched = 0
         no_gps = 0
@@ -291,16 +293,23 @@ async def main(database_url: str, apply: bool, threshold_meters: float, max_drif
 
         if apply:
             async with conn.transaction():
+                # location_inserts里的(city, site_label)在构造时就已经避开了
+                # locations表里现有的label(next_index是从现有记录的最大序号
+                # 接着往下排的)，这里一定是全新的一行，不用处理冲突，直接
+                # RETURNING id拿到刚插入这行的主键，下面UPDATE videos要用
+                location_ids: dict[tuple[str, str], int] = {}
                 for city, site, thr in location_inserts:
-                    await conn.execute(
+                    row = await conn.fetchrow(
                         "INSERT INTO locations (city, site, threshold_meters) VALUES ($1, $2, $3) "
-                        "ON CONFLICT (city, site) DO NOTHING",
+                        "RETURNING id",
                         city, site, thr,
                     )
+                    location_ids[(city, site)] = row["id"]
                 for sha256, city, site, flight_height in video_updates:
+                    location_id = location_ids.get((city, site)) if site is not None else None
                     await conn.execute(
-                        "UPDATE videos SET city = $2, site = $3, flight_height = $4 WHERE sha256 = $1",
-                        sha256, city, site, flight_height,
+                        "UPDATE videos SET city = $2, location_id = $3, flight_height = $4 WHERE sha256 = $1",
+                        sha256, city, location_id, flight_height,
                     )
             print("已写入数据库(--apply)")
         else:

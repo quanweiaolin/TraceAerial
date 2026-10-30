@@ -77,17 +77,21 @@ class Video(Base):
     collect_lat: Mapped[float | None]
     # 2026-10-29加：地址聚类(给下游多视频SIFT对齐用)。city/flight_height从
     # storage_path里符合会话命名规范(session_naming.SESSION_FOLDER_RE)那段
-    # 直接读；site是聚类后的最终地址标签(如panshiroad_1，不是正则里裸的
-    # site分组值)，一旦分配给某个视频就不可再改，只有符合命名规范+有GPS
-    # 坐标(collect_lon/lat)的视频才会被分配，见scanner.py的
-    # _apply_session_metadata/_assign_city_site。srt_height是SRT遥测里
-    # 实际记录的高度(rel_alt，相对起飞点)，跟flight_height(文件夹名里的
-    # 标称高度)分开存，聚类时height维度优先用srt_height，没有才退回
-    # flight_height
+    # 直接读。srt_height是SRT遥测里实际记录的高度(rel_alt，相对起飞点)，
+    # 跟flight_height(文件夹名里的标称高度)分开存，聚类时height维度优先用
+    # srt_height，没有才退回flight_height
     city: Mapped[str | None] = mapped_column(Text)
-    site: Mapped[str | None] = mapped_column(Text)
     flight_height: Mapped[int | None]
     srt_height: Mapped[float | None]
+    # 2026-10-30改：指向locations表的外键，不再直接存site文本——地址标签
+    # 文本(如panshiroad_1)只在locations表存一份，videos这边只存数字id，
+    # 跟devices/operators那套FK风格一致；好处是以后要改一个地址的标签名
+    # (比如起名不好要改)，只用改locations表一行，不用批量改成百上千条
+    # videos记录(2026-10-30讨论，之前的纯文本设计被指出这个问题)。一旦
+    # 分配给某个视频就不可再改，只有符合命名规范+有GPS坐标(collect_lon/
+    # lat)+飞行稳定(is_stable不是False)的视频才会被分配，见scanner.py的
+    # _apply_session_metadata/_assign_city_site
+    location_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("locations.id"))
     # 2026-10-29加：SRT整段轨迹里任意两帧GPS+高度的总位移超过
     # AERIAL_FLIGHT_STABILITY_MAX_DRIFT_METERS就是False——地址聚类假设
     # 拍摄期间飞机基本停在同一点，位移太大这条视频的单点GPS可能不代表
