@@ -439,21 +439,24 @@ async def _download_folder_files(folder: dict[str, Any], cli: PdsCli) -> list[di
     return downloaded
 
 
-def _missing_local_files(folder: dict[str, Any], download_root: Path) -> list[dict[str, Any]]:
-    """已经判定完成下载的文件夹，按云端这次心跳报的每个文件，检查预期的本地
-    路径(跟_download_folder_files算本地路径用的是同一套拼接逻辑)是否真的
-    还是一个文件——这是唯一可靠的"到底还在不在"的判据，不靠videos表的
-    sha1列：sha1只有在文件真实存在、被读过的时候才能算出来，文件本来就
-    丢了的话sha1本来也会是NULL，拿"sha1缺失"去判断"文件丢没丢"是本末倒置
-    (2026-10-29真实事故发现：丢失的36个视频sha1全是NULL，正是因为文件
-    已经不存在，backfill脚本读不到文件没法算，不是别的原因)。
+def _missing_local_files(
+    folder: dict[str, Any], file_entries: list[dict[str, Any]], download_root: Path
+) -> list[dict[str, Any]]:
+    """给定一批文件条目(可以是folder['raw_files']全集，也可以是任意子集，
+    比如_handle_possible_deletion只想查"云端刚丢的那几个"local是否也没了)，
+    按预期的本地路径(跟_download_folder_files算本地路径用的是同一套拼接
+    逻辑)检查是否真的还是一个文件——这是唯一可靠的"到底还在不在"的判据，
+    不靠videos表的sha1列：sha1只有在文件真实存在、被读过的时候才能算出来，
+    文件本来就丢了的话sha1本来也会是NULL，拿"sha1缺失"去判断"文件丢没丢"
+    是本末倒置(2026-10-29真实事故发现：丢失的36个视频sha1全是NULL，正是
+    因为文件已经不存在，backfill脚本读不到文件没法算，不是别的原因)。
 
     是同步阻塞调用(逐个is_file()，走NAS网络IO)，调用方要丢进线程池。
-    返回缺失的原始文件条目列表(跟folder['raw_files']同结构)，方便直接
-    复用现有下载pipeline重新下载——已经存在且内容对得上的文件，底层
-    _file_matches会按哈希自动跳过，不会重复下载。"""
+    返回file_entries里本地确实缺失的那些条目(原样返回，不是只返回名字)，
+    方便直接复用现有下载pipeline重新下载——已经存在且内容对得上的文件，
+    底层_file_matches会按哈希自动跳过，不会重复下载。"""
     missing = []
-    for raw_item in folder["raw_files"]:
+    for raw_item in file_entries:
         relative_path = raw_item.get("relative_path") or raw_item.get("name")
         local_path = download_root / folder["category_folder"] / folder["session_name"] / relative_path
         if not local_path.is_file():
@@ -709,10 +712,24 @@ async def _handle_possible_deletion(
 ) -> None:
     folder_path = folder["cloud_folder_path"]
     last_files = await _last_known_files(session, folder["cloud_folder_id"])
-    missing_names = []
+    missing_entries: list[dict[str, Any]] = []
     if last_files is not None:
         current_ids = {f["file_id"] for f in file_entries}
-        missing_names = [f["name"] for f in last_files if f["file_id"] not in current_ids]
+        missing_entries = [f for f in last_files if f["file_id"] not in current_ids]
+    missing_names = [f["name"] for f in missing_entries]
+
+    # 2026-10-29加：云端丢了文件不代表本地也丢了——本地如果还有完整备份，
+    # 这条告警只是"提醒注意"；本地也没有的话，说明这份内容真的彻底没了，
+    # 要升级成"严重告警"。复用_missing_local_files同一套"按预期路径查
+    # is_file()"逻辑，不是另外发明一套判断方式。last_files为None(历史
+    # 记录不足，连丢了哪几个文件都对比不出来)时没法查具体是哪几个文件，
+    # 不升级，按原有的"告警"级别处理
+    severe = False
+    if missing_entries:
+        locally_missing = await asyncio.to_thread(
+            _missing_local_files, folder, missing_entries, Path(settings.aliyun_download_dir)
+        )
+        severe = len(locally_missing) > 0
 
     session.add(AliyunSyncEvent(
         event_type="issue",
@@ -723,9 +740,10 @@ async def _handle_possible_deletion(
         notified_at=datetime.now(timezone.utc),
     ))
     detail = "、".join(missing_names) if missing_names else "(具体文件名对比不出来，可能是历史记录不足)"
-    print(f"[aliyun] 完成后检测到文件被删除：{folder_path}，疑似丢失：{detail}", flush=True)
+    emoji, level_word = ("🚨", "严重告警") if severe else ("⚠️", "告警")
+    print(f"[aliyun] 完成后检测到文件被删除({level_word})：{folder_path}，疑似丢失：{detail}", flush=True)
     await send_feishu_message(
-        f"{PREFIX_ALIYUN} ⚠️ 已判定完成的文件夹里有文件不见了：{folder_path}，疑似被删除：{detail}"
+        f"{PREFIX_ALIYUN} {emoji} {level_word}：已判定完成的文件夹里有文件不见了：{folder_path}，疑似被删除：{detail}"
     )
 
 
@@ -806,9 +824,10 @@ async def _process_folder(session: AsyncSession, cli: PdsCli, folder: dict[str, 
         # 云端没变(大多数心跳都是这种情况)，但不代表本地磁盘上的文件就一定
         # 还在——2026-10-29真实事故：本地整理文件夹把36个MP4弄丢了，云端
         # 完全没变，这个分支以前直接return，完全没机会发现。按预期路径逐个
-        # 查一下(走NAS网络IO，丢进线程池)，缺了就重新触发下载
+        # 查一下(走NAS网络IO，丢进线程池)，缺了就报警(不自动修复，见
+        # _handle_local_files_missing)
         missing = await asyncio.to_thread(
-            _missing_local_files, folder, Path(settings.aliyun_download_dir)
+            _missing_local_files, folder, folder["raw_files"], Path(settings.aliyun_download_dir)
         )
         if missing:
             await _handle_local_files_missing(session, folder, missing)
