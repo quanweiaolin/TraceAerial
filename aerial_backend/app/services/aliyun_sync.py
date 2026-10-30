@@ -838,6 +838,43 @@ async def _process_folder(session: AsyncSession, cli: PdsCli, folder: dict[str, 
         await _handle_possible_deletion(session, folder, file_entries)
 
 
+async def _detect_removed_folders(session: AsyncSession, current_folder_ids: set[str]) -> None:
+    """正常运维流程(2026-10-30跟用户确认)：确认下载完的文件夹，会整个从
+    云端删掉释放PDS空间(企业空间容量有限，实测已经接近用满)，这不是异常，
+    不需要飞书提醒，只log/print留个记录即可。
+
+    _handle_possible_deletion检测的是"文件夹还在，里面部分文件被删了"；
+    这个函数检测的是另一种情况——文件夹整个消失，run_aliyun_scan每次心跳
+    是从云端根目录现场重新遍历，文件夹整个被删掉后会直接从遍历结果里
+    消失，_process_folder根本不会被调用，之前完全没有代码路径能发现这个
+    情况。只在第一次发现"消失"时记一次(写issue事件去重)，不会每6小时
+    心跳重复刷屏。"""
+    result = await session.execute(
+        select(AliyunSyncEvent.cloud_folder_id, AliyunSyncEvent.cloud_folder_path)
+        .where(AliyunSyncEvent.event_type == "folder_ready")
+        .where(AliyunSyncEvent.download_finished_at.is_not(None))
+    )
+    completed = {row.cloud_folder_id: row.cloud_folder_path for row in result.all()}
+
+    for cloud_folder_id, cloud_folder_path in completed.items():
+        if cloud_folder_id in current_folder_ids:
+            continue
+        already_noted = await _latest_issue_event(session, cloud_folder_id, "folder_removed_from_cloud")
+        if already_noted is not None:
+            continue
+        print(
+            f"[aliyun] 已完成下载的文件夹整个从云端消失(正常运维清理，非异常)：{cloud_folder_path}",
+            flush=True,
+        )
+        session.add(AliyunSyncEvent(
+            event_type="issue",
+            issue_type="folder_removed_from_cloud",
+            cloud_folder_id=cloud_folder_id,
+            cloud_folder_path=cloud_folder_path,
+            notified_at=datetime.now(timezone.utc),
+        ))
+
+
 async def run_aliyun_scan(session: AsyncSession) -> None:
     """完整跑一次：遍历全部drive，找出全部飞行会话文件夹，逐个记心跳、判断
     是否要下载/报警；命名错误的候选文件夹单独报警，不进入监控。
@@ -850,13 +887,17 @@ async def run_aliyun_scan(session: AsyncSession) -> None:
     cli = _build_cli()
     drives = await asyncio.to_thread(list_drives, cli, settings.aliyun_spaces)
     folder_count = 0
+    current_folder_ids: set[str] = set()
     for drive in drives:
         sessions, invalid_candidates = await asyncio.to_thread(_walk_session_folders, cli, drive)
         for candidate in invalid_candidates:
             await _report_invalid_session_name(session, candidate)
             await session.commit()
         for folder in sessions:
+            current_folder_ids.add(folder["cloud_folder_id"])
             await _process_folder(session, cli, folder)
             await session.commit()
             folder_count += 1
+    await _detect_removed_folders(session, current_folder_ids)
+    await session.commit()
     print(f"[aliyun] 扫描完成: drive_count={len(drives)} folder_count={folder_count}", flush=True)
