@@ -149,3 +149,16 @@ async def list_folders_pending(session: AsyncSession = Depends(get_session)):
             for r in rows
         ],
     }
+
+
+# 这条没有对应的/folders-issues端点(目前只有llm_agent的工具在用)，放在这里
+# 跟另外两条查询放一起，是为了只维护一份——不要在app/llm_agent/tools/
+# queries.py里重新抄一份SQL，改一处容易漏改另一处。
+_RECENT_ISSUES_QUERY = text("""
+    SELECT DISTINCT ON (cloud_folder_id)
+        cloud_folder_path, issue_type, created_at
+    FROM aliyun_sync_events
+    WHERE event_type = 'issue'
+    ORDER BY cloud_folder_id, created_at DESC
+    LIMIT 20
+""")
