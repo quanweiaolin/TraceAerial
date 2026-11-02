@@ -70,7 +70,11 @@ async def get_sync_status_report() -> str:
             "pending": [
                 {
                     "cloud_folder_path": r["cloud_folder_path"],
-                    "stable_hours": round(r["stable_hours"], 1) if r["stable_hours"] is not None else None,
+                    # EXTRACT(...)/3600在这条SQL里实测会被asyncpg当成
+                    # decimal.Decimal返回(跟collect_lon/collect_lat那次
+                    # 踩过的坑一样)，先float()再round()，不然json.dumps
+                    # 直接报TypeError(2026-11-02生产实测报错)
+                    "stable_hours": round(float(r["stable_hours"]), 1) if r["stable_hours"] is not None else None,
                 }
                 for r in pending_rows
             ],
@@ -84,6 +88,8 @@ async def get_sync_status_report() -> str:
             ],
         },
         ensure_ascii=False,
+        default=str,  # 兜底：以后再出现什么没转好的类型(Decimal/UUID等)，转成
+                      # 字符串也比直接把整个工具调用崩掉强
     )
 
 
