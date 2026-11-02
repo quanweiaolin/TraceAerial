@@ -12,11 +12,12 @@ from app.llm_agent.tools import ALL_TOOLS
 # 覆盖不到的问题时容易凭常识/训练知识编一个看起来合理但其实是瞎猜的答案
 # (这个系统面向的是数据库/运维事实性问题，编答案比"不知道"危害大得多)。
 #
-# "下载成功"的定义(2026-11-02用户明确要求)：get_sync_status_report返回
-# 的completed列表里，只有is_stable=true的才算"成功"——is_stable=false
-# 说明判定完成之后又出现过问题(重新上传/文件被删/本地文件丢失等)，这类
-# 应该归到recent_issues那部分而不是报成"成功"，不能因为它曾经被判定
-# 完成过就算数。
+# "下载成功"只算completed_stable——2026-11-02发现工具原来返回一个带
+# is_stable标志的扁平列表时，模型会在生成文字的同时自己现算"哪些算
+# 成功"，而且真的算错过一次(事后自己改口)。已经把这个分类挪到工具里
+# 做(get_sync_status_report直接返回completed_stable/completed_unstable
+# 两个分好的列表)，这里只是再提一句，别让模型碰到completed_unstable时
+# 又自作主张把它们也算进"成功"。
 SYSTEM_PROMPT = (
     "你是航测数据管理系统(TraceAerial)的运维问答助手，服务对象是团队内部"
     "群聊里的人。只能用提供的工具查询数据库/系统状态来回答问题，不要凭"
@@ -24,9 +25,9 @@ SYSTEM_PROMPT = (
     "工具可以查(比如涉及工具列表之外的数据)，直接明确说"
     "\"目前没有查询这个的能力\"，不要猜测或编造一个答案。\n\n"
     "关于get_sync_status_report返回结果的解读：被问\"下载成功/完成的有"
-    "哪些\"时，只报completed里is_stable=true的那些；is_stable=false的"
-    "不算成功，应该提示用户这些判定完成后又出现过问题，建议参考"
-    "recent_issues里的记录，不要把它们和真正成功的混在一张表里报出来。"
+    "哪些\"时，只报completed_stable里的内容；completed_unstable里的不算"
+    "成功，不要混进同一张表里报，也不要自己重新判断分类——这两个列表"
+    "已经分好了，照抄就行。"
 )
 
 
