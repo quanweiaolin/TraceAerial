@@ -11,6 +11,7 @@
          真的还在，不限于走阿里云同步进来的那部分；发现缺失只按文件夹粒度
          报一条飞书，不自动修复)
 """
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -20,6 +21,7 @@ from fastapi import FastAPI
 from app.api.routers import aliyun_status, videos
 from app.config import settings
 from app.db import SessionContext
+from app.services import feishu_bot
 from app.services.aliyun_sync import ALIYUN_SCAN_INTERVAL_HOURS, run_aliyun_scan
 from app.services.backfill import backfill_video_metadata
 from app.services.notifier import process_pending_notifications, send_daily_summary
@@ -86,6 +88,10 @@ async def lifespan(app: FastAPI):
     # 不是"有变化要立刻处理"那类任务，没必要在每次服务重启时都额外跑一次
     scheduler.add_job(scheduled_check_missing_files, "interval", weeks=1, id="check_missing_files")
     scheduler.start()
+    # 飞书LLM问答机器人(长连接)：传当前正在跑的主loop进去，因为这个机器人
+    # 在自己专门开的线程里跑，查数据库/调agent那部分要弹回这个主loop执行，
+    # 见services/feishu_bot.py模块docstring
+    feishu_bot.start(asyncio.get_running_loop())
     yield
     scheduler.shutdown()
 

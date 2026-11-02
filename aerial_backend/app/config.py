@@ -2,11 +2,12 @@
 全局配置。所有敏感信息(数据库密码、飞书webhook)走环境变量/.env，
 不要硬编码进代码，方便学生本地跑的时候和线上环境分开。
 """
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_prefix="AERIAL_")
+    model_config = SettingsConfigDict(env_file=".env", env_prefix="AERIAL_", extra="ignore")
 
     # postgresql+asyncpg://user:pass@host:5432/dbname
     database_url: str
@@ -57,6 +58,23 @@ class Settings(BaseSettings):
     # 同一个点(地址聚类/下游SIFT对齐都依赖这个假设)，位移太大说明飘了/
     # 飞手手动飞去了别的地方，这条视频的单点GPS/地址可能不准
     flight_stability_max_drift_meters: float = 30.0
+
+    # LLM agent(飞书问答机器人，app/llm_agent/)：这3个走标准ANTHROPIC_*
+    # 变量名(不带AERIAL_前缀)，因为换Provider/配置时希望跟标准Anthropic
+    # SDK文档/生态的叫法保持一致，不要求用户额外记一套改了名字的变量。
+    # 用validation_alias绕开env_prefix，不靠Anthropic SDK自己探测os.environ
+    # ——SDK的探测只在它自己new出来的进程环境里才生效，换一种启动方式
+    # (systemd EnvironmentFile vs 直接uvicorn/uv run)能不能读到不确定，
+    # 走我们自己的settings跟其它配置项路径一致，更可控。
+    anthropic_auth_token: str = Field(default="", validation_alias="ANTHROPIC_AUTH_TOKEN")
+    anthropic_base_url: str = Field(default="", validation_alias="ANTHROPIC_BASE_URL")
+    anthropic_model: str = Field(default="", validation_alias="ANTHROPIC_MODEL")
+
+    # 飞书LLM问答机器人(app/services/feishu_bot.py)：一个新建的企业自建应用，
+    # 跟上面feishu_webhook_url那个只能单向发消息的自定义机器人是两个完全
+    # 不同的东西，不要混用。长连接模式不需要Verification Token/Encrypt Key。
+    feishu_llm_app_id: str = Field(default="", validation_alias="LLM_Feishu_AppId")
+    feishu_llm_app_secret: str = Field(default="", validation_alias="LLM_Feishu_AppSecret")
 
 
 settings = Settings()
