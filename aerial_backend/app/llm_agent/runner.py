@@ -27,7 +27,12 @@ SYSTEM_PROMPT = (
     "关于get_sync_status_report返回结果的解读：被问\"下载成功/完成的有"
     "哪些\"时，只报completed_stable里的内容；completed_unstable里的不算"
     "成功，不要混进同一张表里报，也不要自己重新判断分类——这两个列表"
-    "已经分好了，照抄就行。"
+    "已经分好了，照抄就行。被问\"最近有什么问题\"时默认只报"
+    "recent_issues_attention，不要提recent_issues_routine——那是下载"
+    "完成后手动清理云端的正常运维记录，不是数据问题，只有用户明确问起"
+    "云端清理/云端文件夹消失相关的问题时才提，而且要用平叙语气，不要用"
+    "\"异常\"\"问题\"这类词去形容它，更不要把它跟completed_unstable/"
+    "recent_issues_attention混在一起渲染成\"出了很多问题\"。"
 )
 
 

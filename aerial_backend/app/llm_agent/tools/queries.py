@@ -17,7 +17,13 @@ completed_unstable两个列表(而不是一个带is_stable字段的列表)：实
 一点的结果里算错(2026-11-02真实报错：模型先把一个is_stable=true的
 文件夹错分进了不稳定列表，写到一半才自己发现改口)。这种分类判断是
 确定性计算，应该在代码里做好，不该指望模型每次生成文本的同时都推理
-正确。
+正确。同理，"最近issue"也在2026-11-02从一条不分类型的查询拆成了
+recent_issues_attention(真正的数据问题)/recent_issues_routine
+(folder_removed_from_cloud，下载完成后手动清云端，正常运维流程)两条：
+之前混在一起按时间取最新20条，模型会把"正常清理"也当成"异常"报出来
+(语气上渲染成问题，但其实不是)；而且如果某几天批量清理了很多云端
+文件夹，还会把真正该关注的file_deleted/local_files_missing类问题
+挤出这20条之外、完全看不到。
 
 返回JSON字符串(不是dict)：@beta_async_tool不会帮你把dict序列化成
 content block，返回裸dict会被Anthropic SDK的tool_result_content()
@@ -35,7 +41,8 @@ from app.api.routers.aliyun_status import (
     ALIYUN_SCAN_INTERVAL_HOURS,
     _FOLDERS_PENDING_QUERY,
     _FOLDERS_READY_QUERY,
-    _RECENT_ISSUES_QUERY,
+    _RECENT_ATTENTION_ISSUES_QUERY,
+    _RECENT_ROUTINE_ISSUES_QUERY,
     _local_path_for,
 )
 from app.config import settings
@@ -44,33 +51,49 @@ from app.db import SessionContext
 
 @beta_async_tool
 async def get_sync_status_report() -> str:
-    """查询阿里云同步流水线的完整现状，一次返回三段：
+    """查询阿里云同步流水线的完整现状，一次返回四段：
     1. completed_stable: 真正下载成功的文件夹(云端路径、本地落盘路径、
        完成时间)——被问"下载成功/完成的有哪些"时直接报这个列表就行
     2. completed_unstable: 虽然判定完成过、但之后又出现过文件丢失/重新
-       上传等问题的文件夹，不算成功，想了解细节要看recent_issues
+       上传等问题的文件夹，不算成功，想了解细节要看
+       recent_issues_attention
     3. pending: 还在累计稳定心跳、尚未判定完成的文件夹(云端路径、已经
        稳定了多少小时)
-    4. recent_issues: 最近出现过异常的文件夹(命名不规范、完成后又上传、
-       文件丢失、本地磁盘文件丢失、文件夹从云端整体消失等)，每个文件夹
-       只给最新一条，最多20条
+    4. recent_issues_attention: 真正值得关注的最近异常(文件被重新上传/
+       删除、本地文件丢失、命名不规范)，每个文件夹只给最新一条，最多20条
+    5. recent_issues_routine: 文件夹从云端整体消失的记录——这是**正常
+       运维流程**(下载完成确认无误后手动清理云端腾空间)，不代表数据有
+       问题，只是陈述事实，不要当成"异常"渲染，最多20条
+
     "下载成功/完成的有哪些"、"还有哪些在等"、"最近有什么问题"这类问题
-    都用这一个工具，不用分开查。completed_stable/completed_unstable这个
-    划分已经在这里分好了，不要自己再按is_stable重新判断一遍——直接照抄
-    对应的列表，避免中间重新分类出错。"""
+    都用这一个工具，不用分开查。completed_stable/completed_unstable、
+    recent_issues_attention/recent_issues_routine这两组划分都已经在这里
+    分好了，不要自己再按字段重新判断一遍——直接照抄对应的列表，避免中间
+    重新分类/定性出错。回答"最近有什么问题"时默认只报
+    recent_issues_attention，recent_issues_routine只在用户明确问起
+    "云端有没有清理过"之类的问题时才提，而且用平叙语气，不要用"异常"
+    "问题"这种词去形容它。"""
     stable_hours = settings.aliyun_stability_scans_required * ALIYUN_SCAN_INTERVAL_HOURS
     async with SessionContext() as session:
         completed_rows = (
             await session.execute(_FOLDERS_READY_QUERY, {"stable_hours": stable_hours})
         ).mappings().all()
         pending_rows = (await session.execute(_FOLDERS_PENDING_QUERY)).mappings().all()
-        issue_rows = (await session.execute(_RECENT_ISSUES_QUERY)).mappings().all()
+        attention_rows = (await session.execute(_RECENT_ATTENTION_ISSUES_QUERY)).mappings().all()
+        routine_rows = (await session.execute(_RECENT_ROUTINE_ISSUES_QUERY)).mappings().all()
 
     def _completed_entry(r: Any) -> dict[str, Any]:
         return {
             "cloud_folder_path": r["cloud_folder_path"],
             "local_path": _local_path_for(r["cloud_folder_path"]),
             "ready_at": str(r["ready_at"]),
+        }
+
+    def _issue_entry(r: Any) -> dict[str, Any]:
+        return {
+            "cloud_folder_path": r["cloud_folder_path"],
+            "issue_type": r["issue_type"],
+            "created_at": str(r["created_at"]),
         }
 
     return json.dumps(
@@ -88,14 +111,8 @@ async def get_sync_status_report() -> str:
                 }
                 for r in pending_rows
             ],
-            "recent_issues": [
-                {
-                    "cloud_folder_path": r["cloud_folder_path"],
-                    "issue_type": r["issue_type"],
-                    "created_at": str(r["created_at"]),
-                }
-                for r in issue_rows
-            ],
+            "recent_issues_attention": [_issue_entry(r) for r in attention_rows],
+            "recent_issues_routine": [_issue_entry(r) for r in routine_rows],
         },
         ensure_ascii=False,
         default=str,  # 兜底：以后再出现什么没转好的类型(Decimal/UUID等)，转成

@@ -151,14 +151,37 @@ async def list_folders_pending(session: AsyncSession = Depends(get_session)):
     }
 
 
-# 这条没有对应的/folders-issues端点(目前只有llm_agent的工具在用)，放在这里
-# 跟另外两条查询放一起，是为了只维护一份——不要在app/llm_agent/tools/
+# 这两条没有对应的/folders-issues端点(目前只有llm_agent的工具在用)，放在
+# 这里跟另外两条查询放一起，是为了只维护一份——不要在app/llm_agent/tools/
 # queries.py里重新抄一份SQL，改一处容易漏改另一处。
-_RECENT_ISSUES_QUERY = text("""
+#
+# 拆成"需要关注"和"正常流程"两条分开查(而不是一条不分类型、按时间取
+# 最新20条)，原因有两个：
+# 1. folder_removed_from_cloud(下载完成后手动清理云端腾空间)是正常运维
+#    流程，不代表数据有问题(aliyun_sync.py里这个事件本来就是log-only，
+#    从不发飞书提醒)——跟reupload_after_complete/file_deleted/
+#    local_files_missing这几个真正的数据问题性质完全不同，混在一起报
+#    "最近异常"会让人以为出了很多问题，但其实只是正常清理。
+# 2. 如果不分开、只按时间取最新20条，一旦某几天清理了很多云端文件夹
+#    (folder_removed_from_cloud密集出现)，会把真正该关注的
+#    file_deleted/local_files_missing类问题挤出这20条之外、完全看不到——
+#    这是真实发生过的情况(2026-11-02)。分开查之后，"需要关注"这条不会
+#    被"正常清理"的噪音挤占名额。
+_RECENT_ATTENTION_ISSUES_QUERY = text("""
     SELECT DISTINCT ON (cloud_folder_id)
         cloud_folder_path, issue_type, created_at
     FROM aliyun_sync_events
     WHERE event_type = 'issue'
+        AND issue_type IN ('reupload_after_complete', 'file_deleted', 'local_files_missing', 'invalid_session_name')
+    ORDER BY cloud_folder_id, created_at DESC
+    LIMIT 20
+""")
+
+_RECENT_ROUTINE_ISSUES_QUERY = text("""
+    SELECT DISTINCT ON (cloud_folder_id)
+        cloud_folder_path, issue_type, created_at
+    FROM aliyun_sync_events
+    WHERE event_type = 'issue' AND issue_type = 'folder_removed_from_cloud'
     ORDER BY cloud_folder_id, created_at DESC
     LIMIT 20
 """)
