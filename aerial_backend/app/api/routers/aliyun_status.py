@@ -53,7 +53,13 @@ _FOLDERS_READY_QUERY = text("""
     latest_issue AS (
         SELECT cloud_folder_id, max(notified_at) AS last_issue_at
         FROM aliyun_sync_events
-        WHERE event_type = 'issue' AND issue_type IN ('reupload_after_complete', 'file_deleted')
+        -- local_files_missing(本地文件真丢了)跟另外两个一样是实打实的数据
+        -- 问题，2026-11-02加进来一起算"不稳定"。不包括folder_removed_from_
+        -- cloud(下载完成后手动清云端，正常运维流程，不代表数据有问题)和
+        -- invalid_session_name(下载前命名校验就拦下来了，根本进不了这里
+        -- 的latest_ready集合，不会跟这张表的任何一行有关联)。
+        WHERE event_type = 'issue'
+            AND issue_type IN ('reupload_after_complete', 'file_deleted', 'local_files_missing')
         GROUP BY cloud_folder_id
     )
     SELECT
@@ -71,7 +77,8 @@ _FOLDERS_READY_QUERY = text("""
 async def list_folders_ready(session: AsyncSession = Depends(get_session)):
     """按"会话文件夹"粒度(不是按地点聚合，同一地点可能有多个文件夹)：
     这个文件夹被aliyun心跳判定下载完成过，而且完成之后要么从没再变动，
-    要么最后一次变动(又有新上传/文件被删除)距今已经超过稳定期——稳定期
+    要么最后一次变动(又有新上传/文件被删除/本地文件丢失)距今已经超过
+    稳定期——稳定期
     = AERIAL_ALIYUN_STABILITY_SCANS_REQUIRED * 心跳间隔小时数，实时读
     settings，不是写死的数字，改.env配置下次请求就自动生效。"""
     stable_hours = settings.aliyun_stability_scans_required * ALIYUN_SCAN_INTERVAL_HOURS
