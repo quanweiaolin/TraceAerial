@@ -90,3 +90,55 @@ async def list_folders_ready(session: AsyncSession = Depends(get_session)):
             for r in rows
         ],
     }
+
+
+_FOLDERS_PENDING_QUERY = text("""
+    WITH ready AS (
+        SELECT DISTINCT cloud_folder_id FROM aliyun_sync_events
+        WHERE event_type = 'folder_ready' AND download_finished_at IS NOT NULL
+    ),
+    last_change AS (
+        SELECT DISTINCT ON (cloud_folder_id) cloud_folder_id, scanned_at AS changed_at
+        FROM aliyun_folder_scans WHERE changed = true
+        ORDER BY cloud_folder_id, scanned_at DESC
+    ),
+    first_seen AS (
+        SELECT cloud_folder_id, min(scanned_at) AS first_seen_at
+        FROM aliyun_folder_scans GROUP BY cloud_folder_id
+    ),
+    latest_scan AS (
+        SELECT DISTINCT ON (cloud_folder_id) cloud_folder_id, cloud_folder_path, scanned_at
+        FROM aliyun_folder_scans ORDER BY cloud_folder_id, scanned_at DESC
+    )
+    SELECT
+        s.cloud_folder_path,
+        EXTRACT(EPOCH FROM (now() - COALESCE(c.changed_at, f.first_seen_at))) / 3600 AS stable_hours
+    FROM latest_scan s
+    JOIN first_seen f USING (cloud_folder_id)
+    LEFT JOIN last_change c USING (cloud_folder_id)
+    WHERE s.cloud_folder_id NOT IN (SELECT cloud_folder_id FROM ready)
+    ORDER BY stable_hours DESC
+""")
+
+
+@router.get("/folders-pending")
+async def list_folders_pending(session: AsyncSession = Depends(get_session)):
+    """跟/folders-ready互补：还没判定下载完成、仍在累计稳定心跳期的文件夹。
+    stable_hours是从"最近一次云端真的发生变化"的那次心跳到现在过了多少
+    小时(从没变化过就从第一次被发现时算起)——拿这个数跟
+    AERIAL_ALIYUN_STABILITY_SCANS_REQUIRED*心跳间隔小时数(也是
+    stable_hours_threshold返回的这个值)比一下，就知道大概还要多久会被
+    判定完成。"""
+    result = await session.execute(_FOLDERS_PENDING_QUERY)
+    rows = result.mappings().all()
+    stable_hours_threshold = settings.aliyun_stability_scans_required * ALIYUN_SCAN_INTERVAL_HOURS
+    return {
+        "stable_hours_threshold": stable_hours_threshold,
+        "folders": [
+            {
+                "cloud_folder_path": r["cloud_folder_path"],
+                "stable_hours": round(r["stable_hours"], 1) if r["stable_hours"] is not None else None,
+            }
+            for r in rows
+        ],
+    }
