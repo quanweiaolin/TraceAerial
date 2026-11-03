@@ -5,6 +5,13 @@
 已废弃)，且Mavic3E统一缩写成m3e——这是第三版规范了，改动点都记在这，
 以后再变就对照这里看哪些字段真的变了。
 
+2026-11-03：加mavic4pro/mini5pro两个新机型——scanner.py常规扫盘碰到不在
+白名单里的机型名不会报错(find_session_match返回None就悄悄跳过，见其
+docstring"不是所有视频都来自这套命名规范"那段)，之前学生手动下载的
+shanghai_jianchuanroad_mavic4pro_...和nanning_..._mini5pro_...这几个
+会话文件夹就是这样，city/device_id/location_id全部静默留空，没有任何
+报错/提示，排查了好一阵才发现是机型名没加进白名单。
+
 被两边共用，所以单独拆出来，不然scanner.py想复用aliyun_sync.py这边的正则，
 会跟aliyun_sync.py导入scanner.py的run_scan形成循环import：
   - services/aliyun_sync.py：校验云端文件夹命名、算本地落盘用的分类目录
@@ -32,7 +39,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-SESSION_FOLDER_DEVICES = ("m3e", "air2s", "air3s", "mini4pro", "mini3pro")
+SESSION_FOLDER_DEVICES = ("m3e", "air2s", "air3s", "mini4pro", "mini3pro", "mavic4pro", "mini5pro")
 SESSION_FOLDER_RE = re.compile(
     r"^(?P<city>[a-z]+)_(?P<site>[a-z0-9]+)_"
     r"(?P<drone>" + "|".join(SESSION_FOLDER_DEVICES) + r")_"
