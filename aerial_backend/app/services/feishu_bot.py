@@ -60,9 +60,15 @@ def _run_ws_client(main_loop: asyncio.AbstractEventLoop) -> None:
     def on_message_receive(event: Any) -> None:
         _dispatch_message(main_loop, event)
 
+    def _ignore(event: Any) -> None:
+        pass  # 群里消息被加/取消表情回应时飞书也会推这个事件，我们不关心，注册个空处理器
+              # 不然SDK自己的dispatcher找不到处理器会报"processor not found"刷日志
+
     handler = (
         lark.EventDispatcherHandler.builder("", "")  # 长连接模式不需要encrypt_key/verification_token
         .register_p2_im_message_receive_v1(on_message_receive)
+        .register_p2_im_message_reaction_created_v1(_ignore)
+        .register_p2_im_message_reaction_deleted_v1(_ignore)
         .build()
     )
     client = lark.ws.Client(
