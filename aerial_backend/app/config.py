@@ -35,9 +35,19 @@ class Settings(BaseSettings):
     # PDS哪几个空间要扫，跟pds-drive-sync自己的默认一致
     aliyun_spaces: list[str] = ["personal", "team", "enterprise"]
     # 下载落地根目录。默认是repo下的data/(本地测试用的SSD暂存目录)，
-    # 生产环境在.env里配成真实的NAS路径(比如/mnt/Expansion2/Aerial_Raw_Videos)，
-    # 下载完成后会自动scanner.run_scan扫描进videos库，见services/aliyun_sync.py
+    # 生产环境在.env里配成真实的NAS路径——如果这个路径走的是bindfs(比如
+    # /mnt/Expansion2-shared/Aerial_Raw_Videos，PDS下载工具要chmod，exFAT
+    # 不支持chmod，必须靠bindfs的--chmod-ignore才不报错)，下面的
+    # aliyun_scan_dir要填它的直连等价路径
     aliyun_download_dir: str = "data"
+    # 下载完成后真正拿去run_scan扫描入库(写videos.storage_path)用的路径，
+    # 跟aliyun_download_dir指向同一份物理文件，只是不带bindfs这层——
+    # videos.storage_path不该出现bindfs路径(2026-11-03确定)：bindfs是单个
+    # 用户态FUSE进程转发所有请求，机器繁忙时实测比直连慢约1000倍，而且
+    # 不能指望"以后靠常规扫盘扫到直连路径"兜底，常规扫盘本身会被
+    # AERIAL_SCAN_ROOTS里的大目录拖得严重滞后(max_instances=1)。没单独
+    # 配置(本地测试没必要分两个路径)就跟aliyun_download_dir一样
+    aliyun_scan_dir: str = ""
     # 下载前检查这个目录所在盘的剩余空间(GiB)，不够就飞书提示、不下载
     aliyun_min_free_gb: int = 200
     # 连续多少次心跳大小/文件数都没变，才判定"上传完成"(6小时一次心跳，

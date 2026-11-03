@@ -109,7 +109,8 @@ def main() -> None:
 
         for folder in sessions:
             size = sum(int(f.get("size") or 0) for f in folder["raw_files"])
-            local = f"{settings.aliyun_download_dir}/{folder['category_folder']}/{folder['session_name']}"
+            scan_dir = settings.aliyun_scan_dir or settings.aliyun_download_dir  # 预览给人看，不该带bindfs这层
+            local = f"{scan_dir}/{folder['category_folder']}/{folder['session_name']}"
             print(f"[OK] {folder['cloud_folder_path']}")
             print(f"     -> 本地: {local}")
             print(f"     文件数: {len(folder['raw_files'])}  总大小: {_human_bytes(size)}")

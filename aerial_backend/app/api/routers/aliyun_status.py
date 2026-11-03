@@ -8,12 +8,15 @@
 
 本地路径(local_path)不是存出来的，是现算的：aliyun_sync_events只存了
 cloud_folder_path(阿里云那边的路径，不是本地盘上的路径，学生拿着没法直接
-用)。本地实际落盘路径 = aliyun_download_dir/category_folder/session_name，
-其中session_name就是cloud_folder_path的最后一段(_walk_session_folders里
-这两个本来就是同一个字符串)，category_folder是从session_name用
-derive_category_folder()确定性算出来的(年份_城市_AerialVideos_季度)——
-跟_trigger_download实际下载时用的是同一套计算方式，不会跟真实落盘位置
-对不上，也不用另外存一份、担心哪天两边逻辑改了互相脱节。
+用)。本地实际落盘路径 = aliyun_scan_dir/category_folder/session_name(用
+scan_dir不是download_dir——这里是给人看/给agent用的展示路径，不该带
+bindfs这层，道理跟videos.storage_path一样，见services/aliyun_sync.py里
+_trigger_download那段注释)，其中session_name就是cloud_folder_path的
+最后一段(_walk_session_folders里这两个本来就是同一个字符串)，
+category_folder是从session_name用derive_category_folder()确定性算出来的
+(年份_城市_AerialVideos_季度)——跟_trigger_download实际下载时用的是同一套
+计算方式，不会跟真实落盘位置对不上，也不用另外存一份、担心哪天两边逻辑
+改了互相脱节。
 """
 from pathlib import Path
 
@@ -40,7 +43,8 @@ def _local_path_for(cloud_folder_path: str) -> str | None:
     if match is None:
         return None
     category_folder = derive_category_folder(match)
-    return str(Path(settings.aliyun_download_dir) / category_folder / session_name)
+    scan_dir = settings.aliyun_scan_dir or settings.aliyun_download_dir  # 没单独配就退化成跟下载目录一样
+    return str(Path(scan_dir) / category_folder / session_name)
 
 _FOLDERS_READY_QUERY = text("""
     WITH latest_ready AS (

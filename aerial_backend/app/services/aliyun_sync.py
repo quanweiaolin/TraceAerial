@@ -590,24 +590,36 @@ async def _trigger_download(
         # 只是触发时机和范围精确到"刚下载完的这一个文件夹"，不用等下一次
         # 全量扫盘。scan失败也算这次没完成，不标记download_finished_at，
         # 下次心跳(云端内容没变、还在"稳定"状态)会自动整体重试
-        local_folder = Path(settings.aliyun_download_dir).resolve() / folder["category_folder"] / folder["session_name"]
-        if not _is_within_scan_roots(local_folder):
-            # 防火墙：aliyun_download_dir必须明确配在AERIAL_SCAN_ROOTS范围内，
+        # 下载落地用aliyun_download_dir(bindfs，chmod需要它)，但扫描入库
+        # 用aliyun_scan_dir(bindfs的直连等价路径)——同一份物理文件，只是
+        # 记进videos.storage_path的路径字符串不一样。2026-11-03改的：
+        # 之前这里直接扫aliyun_download_dir，storage_path里全带
+        # "Expansion2-shared"，不仅读起来慢(bindfs单进程FUSE开销，实测
+        # 比直连慢约1000倍)，而且如果指望"以后靠常规1小时扫盘兜底扫
+        # 直连路径"，常规扫盘本身会被AERIAL_SCAN_ROOTS里那个17930文件的
+        # 大目录拖得严重滞后(max_instances=1，上一轮没扫完下一轮直接被
+        # 跳过)，不是稳定的1小时延迟。这里单独算一次直连路径、立刻扫
+        # 这一个刚下载完的文件夹(范围小，不依赖那个大扫盘)，两个问题
+        # 一次解决。
+        scan_dir = settings.aliyun_scan_dir or settings.aliyun_download_dir  # 没单独配就退化成跟下载目录一样
+        scan_folder = Path(scan_dir).resolve() / folder["category_folder"] / folder["session_name"]
+        if not _is_within_scan_roots(scan_folder):
+            # 防火墙：aliyun_scan_dir必须明确配在AERIAL_SCAN_ROOTS范围内，
             # 才会自动扫描进videos库。2026-10-09发现：测试时download_dir临时
             # 指向过SSD暂存目录(不在scan_roots内)，照样被扫进了正式的videos
-            # 表，污染了生产数据。以后download_dir指向任何不在scan_roots里的
+            # 表，污染了生产数据。以后scan_dir指向任何不在scan_roots里的
             # 地方(比如临时测试路径)，下载依然正常完成，但不会自动入库，
             # 避免同样的事故重演
             print(
-                f"[aliyun] 下载目录不在AERIAL_SCAN_ROOTS范围内，跳过扫描入库(不算失败)：{local_folder}",
+                f"[aliyun] 扫描目录不在AERIAL_SCAN_ROOTS范围内，跳过扫描入库(不算失败)：{scan_folder}",
                 flush=True,
             )
         else:
             try:
-                await run_scan(session, str(local_folder))
+                await run_scan(session, str(scan_folder))
             except Exception as exc:  # noqa: BLE001  范围特意放宽：扫描入库这一步绝不能让整个扫描循环中断
                 scanned_in = False
-                print(f"[aliyun] 下载完成但扫描入库失败：{local_folder}  {exc}", flush=True)
+                print(f"[aliyun] 下载完成但扫描入库失败：{scan_folder}  {exc}", flush=True)
                 await send_feishu_message(f"{PREFIX_ALIYUN} ⚠️ 下载完成但扫描入库失败：{folder_path}\n{exc}")
     all_succeeded = all_succeeded and scanned_in
 
