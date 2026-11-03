@@ -110,6 +110,8 @@ SELECT storage_path FROM videos WHERE collect_lon IS NULL OR collect_lat IS NULL
 | `sha256`                      | 视频内容的sha256哈希（32字节），主键，用于内容去重                                                            |
 | `original_name`               | 原始文件名                                                                                                    |
 | `storage_path`                | 视频在服务器/NAS上的绝对路径                                                                                  |
+
+> `storage_path`如果是`/mnt/Expansion2-shared/...`开头：这是走bindfs的路径，专门给阿里云下载流程用的(下载工具要chmod，exFAT不支持chmod，bindfs负责吞掉这个调用)，跟"读文件"没关系，但读的时候照样要绕一圈FUSE——实测同一份数据直连读能到2.9GB/s，走这条路径只有2.8MB/s，差了1000倍。**人工查看/拷贝数据时，把`Expansion2-shared`换成`Expansion2`**，内容完全一样、快得多：`path.replace("Expansion2-shared", "Expansion2")`，或者直接用`aerial_backend/scripts/fast_path.py`(支持更多这类映射，配置在不提交进git的`path_aliases.json`里，第一次用先`cp path_aliases.json.example path_aliases.json`)。
 | `file_size_bytes`             | 文件大小（字节）                                                                                              |
 | `duration_seconds`            | 视频时长（秒）                                                                                                |
 | `width` / `height`            | 分辨率                                                                                                        |

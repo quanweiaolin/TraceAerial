@@ -1,5 +1,9 @@
 # 环境变量（含真实密钥/密码，绝不提交）
 .env
+
+# bindfs慢路径->直连快路径的映射，机器拓扑变了就要改，不跟代码一起提交
+# (保留path_aliases.json.example作为模板)，见scripts/fast_path.py
+path_aliases.json
  
 # Python
 __pycache__/
