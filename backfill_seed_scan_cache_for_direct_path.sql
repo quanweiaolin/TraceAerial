@@ -6,32 +6,36 @@
 -- 根本没变。这条SQL把已知的哈希值"种"进scan_discoveries，让scanner.py
 -- 扫到对应的直连路径文件时能直接命中缓存、不用重新读文件。
 --
--- 只在“这些文件在扫盘还没扫到之前”跑才有意义——已经被当前这轮扫描
+-- (第一版写错了：以为videos.storage_path还带-shared前缀，要substring
+-- 替换；实测backfill_remove_expansion2_shared_prefix.sql已经跑过了，
+-- storage_path已经是直连路径，这里直接用，不用再替换前缀)
+--
+-- 只在"这些文件在扫盘还没扫到之前"跑才有意义——已经被当前这轮扫描
 -- 处理过的文件，救不回那部分已经花掉的时间，但能帮后面还没扫到的部分。
 -- ============================================================
 
 SET search_path TO aerial, public;
 
 -- 1. dry run，看一下能种多少条
-SELECT COUNT(*) FROM videos WHERE storage_path LIKE '/mnt/Expansion2-shared/%' AND deleted_at IS NULL;
+SELECT COUNT(*) FROM videos WHERE storage_path LIKE '/mnt/Expansion2/%' AND deleted_at IS NULL;
 
 -- 2. 建一个合成的scan_job给这批缓存记录挂一个合法的scan_job_id
 --    (scan_discoveries.scan_job_id是NOT NULL外键，必须有)
 WITH seed_job AS (
     INSERT INTO scan_jobs (root_path, started_at, finished_at, files_found, files_new, files_duplicate, status)
-    VALUES ('backfill: expansion2-shared直连路径缓存种子(2026-11-03)', now(), now(), 0, 0, 0, 'completed')
+    VALUES ('backfill: expansion2直连路径缓存种子(2026-11-03)', now(), now(), 0, 0, 0, 'completed')
     RETURNING id
 )
 INSERT INTO scan_discoveries (scan_job_id, file_path, file_size_bytes, hash_status, sha256, discovered_at)
 SELECT
     seed_job.id,
-    '/mnt/Expansion2/' || substring(storage_path FROM length('/mnt/Expansion2-shared/') + 1),
+    storage_path,
     file_size_bytes,
     'done',
     sha256,
     now()
 FROM videos, seed_job
-WHERE storage_path LIKE '/mnt/Expansion2-shared/%' AND deleted_at IS NULL;
+WHERE storage_path LIKE '/mnt/Expansion2/%' AND deleted_at IS NULL;
 
 -- 3. 验证：种了多少条(应该跟第1步的数字一致)
 SELECT COUNT(*) FROM scan_discoveries WHERE file_path LIKE '/mnt/Expansion2/%' AND hash_status = 'done'
