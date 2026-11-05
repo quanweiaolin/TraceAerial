@@ -47,18 +47,22 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # aerial_backend/
 
 from sqlalchemy import select  # noqa: E402
+from sqlalchemy.ext.asyncio import AsyncSession  # noqa: E402
 
 from app.config import settings  # noqa: E402
 from app.db import SessionContext  # noqa: E402
 from app.models import AliyunSyncEvent, Video  # noqa: E402
 from app.services.aliyun_sync import (  # noqa: E402
     PREFIX_ALIYUN,
+    RECONCILE_MAX_ATTEMPTS,
     _build_cli,
-    _download_with_reconciliation,
+    _count_local_files,
+    _download_folder_files,
     _gather_all_files,
     _is_within_scan_roots,
     ensure_enough_space,
@@ -113,6 +117,106 @@ def _resolve_at_root(session_name: str) -> tuple[str, str]:
     return matches[0]
 
 
+def _to_scan_path(download_local_path: str) -> str:
+    """把_download_one_file返回的本地路径(永远是以aliyun_download_dir为根)
+    换算成以aliyun_scan_dir为根的等价路径——两者是同一份物理文件，只是
+    run_scan记进videos.storage_path时用的是scan_dir(bindfs的直连等价
+    路径，见app/config.py里aliyun_scan_dir的注释)，查DB必须按这个换算后
+    的路径查，不能直接拿下载时的路径去查(2026-11-05测试这个脚本时发现：
+    没换算直接查一条都查不到，会被误判成sha1全部对不上)。"""
+    download_root = Path(settings.aliyun_download_dir).resolve()
+    scan_root = Path(settings.aliyun_scan_dir or settings.aliyun_download_dir).resolve()
+    relative = Path(download_local_path).resolve().relative_to(download_root)
+    return str(scan_root / relative)
+
+
+async def _split_by_db_cache(
+    session: AsyncSession, folder: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """按DB里已经有的sha1/sha256，把这次云端报的文件列表拆成两份：确认
+    能跳过的(不用碰_download_one_file，省掉它内部_file_matches()重新读
+    整个文件验证哈希的开销——对几个GB的视频来说这是真实的时间差)，和
+    真的需要走下载/验证流程的(DB里没有、或者有但哈希对不上，一律走
+    常规那套保守验证，不弱化)。
+
+    信任前提：本地文件自扫描入库以来没被改坏过(这套系统基本只增不改，
+    风险很低但不是零，2026-11-05跟用户讨论过这个取舍)。只改这个脚本
+    自己的逻辑，不碰_download_one_file/_file_matches那条常规自动化
+    流程共用的路径——出问题影响范围只限于"紧急下载"这一个功能。"""
+    scan_root = Path(settings.aliyun_scan_dir or settings.aliyun_download_dir).resolve()
+    by_scan_path: dict[str, dict[str, Any]] = {}
+    for raw_item in folder["raw_files"]:
+        relative_path = raw_item.get("relative_path") or raw_item.get("name")
+        local_relative = f"{folder['category_folder']}/{folder['session_name']}/{relative_path}"
+        by_scan_path[str(scan_root / local_relative)] = raw_item
+
+    known: dict[str, tuple[bytes | None, bytes | None]] = {}
+    if by_scan_path:
+        result = await session.execute(
+            select(Video.storage_path, Video.sha1, Video.sha256).where(Video.storage_path.in_(by_scan_path.keys()))
+        )
+        known = {row.storage_path: (row.sha1, row.sha256) for row in result}
+
+    confirmed_skip: list[dict[str, Any]] = []
+    need_download: list[dict[str, Any]] = []
+    download_root = Path(settings.aliyun_download_dir).resolve()
+    for scan_path, raw_item in by_scan_path.items():
+        algo = str(raw_item.get("content_hash_name") or "").lower()
+        expected_hex = str(raw_item.get("content_hash") or "").lower()
+        sha1_val, sha256_val = known.get(scan_path, (None, None))
+        matched = (
+            (algo == "sha1" and bool(sha1_val) and sha1_val.hex() == expected_hex)
+            or (algo == "sha256" and bool(sha256_val) and sha256_val.hex() == expected_hex)
+        )
+        if not matched:
+            need_download.append(raw_item)
+            continue
+        relative_path = raw_item.get("relative_path") or raw_item.get("name")
+        local_relative = f"{folder['category_folder']}/{folder['session_name']}/{relative_path}"
+        confirmed_skip.append({
+            "cloud_file_id": raw_item.get("file_id"),
+            "cloud_path": f"{folder['cloud_folder_path'].rstrip('/')}/{relative_path}",
+            "content_hash": raw_item.get("content_hash"),
+            "content_hash_algo": raw_item.get("content_hash_name"),
+            "local_path": str(download_root / local_relative),  # 跟_download_one_file返回格式保持一致(download_dir为根)
+            "download_status": "skipped",
+        })
+    return confirmed_skip, need_download
+
+
+async def _download_with_db_skip(
+    session: AsyncSession, folder: dict[str, Any], cli: Any
+) -> tuple[list[dict[str, Any]], bool]:
+    """跟aliyun_sync._download_with_reconciliation语义一致(核对文件数、
+    对不上重试最多RECONCILE_MAX_ATTEMPTS次)，区别是下载前先用
+    _split_by_db_cache()筛掉DB里已确认的文件，只对剩下的真正调
+    _download_folder_files。reconciliation用的expected_count是原始
+    完整文件数(folder["raw_files"])，不是筛掉之后的数量——
+    _count_local_files数的是磁盘上实际文件数，包含被跳过的那些，口径
+    要对得上。"""
+    confirmed_skip, need_download = await _split_by_db_cache(session, folder)
+    print(
+        f"[urgent_download] DB缓存确认跳过{len(confirmed_skip)}个(内容已验证过，不重新读取)，"
+        f"还需下载/验证{len(need_download)}个",
+        flush=True,
+    )
+    expected_count = len(folder["raw_files"])
+    downloaded_new: list[dict[str, Any]] = []
+    reconciled = False
+    for attempt in range(1, RECONCILE_MAX_ATTEMPTS + 1):
+        downloaded_new = await _download_folder_files({**folder, "raw_files": need_download}, cli)
+        actual_count = _count_local_files(folder, Path(settings.aliyun_download_dir))
+        if actual_count == expected_count:
+            reconciled = True
+            break
+        print(
+            f"[urgent_download] 文件数核对不上(第{attempt}/{RECONCILE_MAX_ATTEMPTS}次)："
+            f"云端{expected_count}个，本地实际{actual_count}个",
+            flush=True,
+        )
+    return confirmed_skip + downloaded_new, reconciled
+
+
 async def _run_worker(session_name: str, drive_id: str, cloud_folder_id: str) -> None:
     match = SESSION_FOLDER_RE.match(session_name)
     if match is None:
@@ -142,30 +246,31 @@ async def _run_worker(session_name: str, drive_id: str, cloud_folder_id: str) ->
         await send_feishu_message(f"{PREFIX_ALIYUN} ❌ 紧急下载失败：{session_name}，磁盘空间不足")
         return
 
-    download_started_at = datetime.now(timezone.utc)
-    downloaded, reconciled = await _download_with_reconciliation(folder, cli)
-    download_finished_at = datetime.now(timezone.utc)
-    all_succeeded = all(d.get("download_status") != "failed" for d in downloaded) and reconciled
-    if not all_succeeded:
-        failed = [d for d in downloaded if d.get("download_status") == "failed"]
-        await send_feishu_message(
-            f"{PREFIX_ALIYUN} ❌ 紧急下载失败：{session_name}\n"
-            f"文件数核对{'没对上' if not reconciled else '对上了'}，{len(failed)}个文件下载失败"
-        )
-        print(f"[urgent_download] 失败: {session_name}  reconciled={reconciled}  failed={len(failed)}", flush=True)
-        return
-
     scan_dir = settings.aliyun_scan_dir or settings.aliyun_download_dir
     scan_folder = (Path(scan_dir).resolve() / category_folder / session_name)
-    if not _is_within_scan_roots(scan_folder):
-        await send_feishu_message(
-            f"{PREFIX_ALIYUN} ⚠️ 紧急下载完成，但扫描目录不在AERIAL_SCAN_ROOTS范围内，"
-            f"没有自动入库，需要管理员手动处理：{scan_folder}"
-        )
-        print(f"[urgent_download] 下载完成但不在scan_roots范围内，跳过入库: {scan_folder}", flush=True)
-        return
 
     async with SessionContext() as session:
+        download_started_at = datetime.now(timezone.utc)
+        downloaded, reconciled = await _download_with_db_skip(session, folder, cli)
+        download_finished_at = datetime.now(timezone.utc)
+        all_succeeded = all(d.get("download_status") != "failed" for d in downloaded) and reconciled
+        if not all_succeeded:
+            failed = [d for d in downloaded if d.get("download_status") == "failed"]
+            await send_feishu_message(
+                f"{PREFIX_ALIYUN} ❌ 紧急下载失败：{session_name}\n"
+                f"文件数核对{'没对上' if not reconciled else '对上了'}，{len(failed)}个文件下载失败"
+            )
+            print(f"[urgent_download] 失败: {session_name}  reconciled={reconciled}  failed={len(failed)}", flush=True)
+            return
+
+        if not _is_within_scan_roots(scan_folder):
+            await send_feishu_message(
+                f"{PREFIX_ALIYUN} ⚠️ 紧急下载完成，但扫描目录不在AERIAL_SCAN_ROOTS范围内，"
+                f"没有自动入库，需要管理员手动处理：{scan_folder}"
+            )
+            print(f"[urgent_download] 下载完成但不在scan_roots范围内，跳过入库: {scan_folder}", flush=True)
+            return
+
         try:
             await run_scan(session, str(scan_folder))
         except Exception as exc:  # noqa: BLE001  扫描入库这一步绝不能让整个流程静默失败不报错
@@ -181,7 +286,7 @@ async def _run_worker(session_name: str, drive_id: str, cloud_folder_id: str) ->
         # 这是"紧急"模式专门加的一道保险，常规自动化流程(_trigger_download)
         # 只核对文件数量，不校验内容哈希
         sha1_expected: dict[str, str] = {
-            item["local_path"]: item["content_hash"].lower()
+            _to_scan_path(item["local_path"]): item["content_hash"].lower()
             for item in downloaded
             if item.get("content_hash_algo") == "sha1" and item.get("content_hash") and item.get("local_path")
         }
