@@ -143,3 +143,37 @@ gets retired, and the new file gets ingested as a completely unrelated new video
 its new location (content unchanged — the system will automatically detect this as a
 "whole-folder move" and send a notification), confirm the move took effect, and only then
 re-encode it in place at the new location.
+
+## Urgent Download Tool (skip the stability wait, download + ingest immediately)
+
+Normally, a newly-uploaded Aliyun folder has to wait for "no change across several
+consecutive heartbeats" (usually a few days) before the system considers it "fully
+uploaded" and downloads it automatically. If you have an urgent need (e.g. a client
+needs a specific folder processed right now) and can't wait those few days, use this
+script instead:
+
+```bash
+cd aerial_backend
+uv run python scripts/urgent_download.py \
+    --session-name shanghai_jianchuanroad_mavic4pro_120m_wangxiangyu_20261104
+```
+
+`--session-name` must be the complete session folder name (format
+`city_site_drone_height_person_date`; the drone model has to be in the whitelist
+`SESSION_FOLDER_DEVICES` in `app/services/session_naming.py` — ask an admin to add a
+new model if needed), and that folder must sit at the **root** of a cloud drive (not
+nested inside another folder). If either check fails, the command exits immediately
+with a clear terminal error — nothing gets downloaded, no messages get sent.
+
+Once validation passes, the command hands control of the terminal back to you right
+away (no need for `&` or `nohup` yourself) — the actual download runs independently in
+the background. A Feishu message is sent to the group on both success and failure. If
+you don't hear back within, say, half an hour, just re-run the exact same command —
+this script is designed to be safely re-run: already-downloaded files won't be
+re-transferred, and already-ingested videos won't end up duplicated in the database.
+
+**This tool skips the "stability wait" safety net.** That means it might grab a cloud
+folder that's still mid-upload — this is a deliberate tradeoff of "urgent" mode, not a
+bug, and there's no way around it. If more files show up in the cloud afterward, the
+regular automated pipeline will detect that and alert via Feishu, but there's no
+guarantee the first grab was complete.
