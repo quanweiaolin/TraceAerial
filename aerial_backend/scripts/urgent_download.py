@@ -68,7 +68,7 @@ from app.services.aliyun_sync import (  # noqa: E402
     ensure_enough_space,
 )
 from app.services.notifier import send_feishu_message  # noqa: E402
-from app.services.scanner import run_scan  # noqa: E402
+from app.services.scanner import VIDEO_EXTENSIONS, run_scan  # noqa: E402
 from app.services.session_naming import (  # noqa: E402
     SESSION_FOLDER_DEVICES,
     SESSION_FOLDER_RE,
@@ -284,11 +284,17 @@ async def _run_worker(session_name: str, drive_id: str, cloud_folder_id: str) ->
         # sha1校验：下载时云端report的content_hash(算法是sha1的那些) vs
         # 扫描入库后videos表里真实算出来的sha1，确认内容没问题才算真正完成——
         # 这是"紧急"模式专门加的一道保险，常规自动化流程(_trigger_download)
-        # 只核对文件数量，不校验内容哈希
+        # 只核对文件数量，不校验内容哈希。只对VIDEO_EXTENSIONS这几种视频
+        # 扩展名的文件查——SRT遥测字幕文件压根不会被scanner.py扫进videos表
+        # (它跟着视频一起下载，但不是视频本身)，拿SRT文件去查videos表
+        # 永远查不到，会被误判成"sha1不匹配"(2026-11-05实测踩过：52个文件
+        # 里26个SRT全部被误报成不匹配，其实下载内容完全没问题，SRT的正确性
+        # 已经由下载那一层的_file_matches()保证过了，不需要再查videos表)
         sha1_expected: dict[str, str] = {
             _to_scan_path(item["local_path"]): item["content_hash"].lower()
             for item in downloaded
             if item.get("content_hash_algo") == "sha1" and item.get("content_hash") and item.get("local_path")
+            and Path(item["local_path"]).suffix.lower() in VIDEO_EXTENSIONS
         }
         mismatches: list[tuple[str, str, str | None]] = []
         if sha1_expected:
