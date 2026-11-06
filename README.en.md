@@ -172,6 +172,17 @@ you don't hear back within, say, half an hour, just re-run the exact same comman
 this script is designed to be safely re-run: already-downloaded files won't be
 re-transferred, and already-ingested videos won't end up duplicated in the database.
 
+If you'd rather not SSH into the server, you can hit the same thing over HTTP instead —
+same validation, same background job:
+
+```bash
+curl -X POST "http://<server-address>:8088/aliyun/urgent-download?session_name=shanghai_jianchuanroad_mavic4pro_120m_wangxiangyu_20261104"
+```
+
+A bad format returns 422 with the specific problem; a folder not found at any drive
+root returns 404; a 200 means validation passed, with the background log path in the
+response body — the actual result still comes through Feishu.
+
 **This tool skips the "stability wait" safety net.** That means it might grab a cloud
 folder that's still mid-upload — this is a deliberate tradeoff of "urgent" mode, not a
 bug, and there's no way around it. If more files show up in the cloud afterward, the
