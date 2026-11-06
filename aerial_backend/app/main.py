@@ -18,7 +18,7 @@ from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
 
-from app.api.routers import aliyun_status, videos
+from app.api.routers import aliyun_status, aliyun_urgent_download, videos
 from app.config import settings
 from app.db import SessionContext
 from app.services import feishu_bot
@@ -99,6 +99,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Aerial Video Data Management", lifespan=lifespan)
 app.include_router(videos.router)
 app.include_router(aliyun_status.router)
+app.include_router(aliyun_urgent_download.router)
 
 
 @app.post("/scan/trigger")
