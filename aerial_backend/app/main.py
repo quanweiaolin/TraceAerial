@@ -7,7 +7,7 @@
       3) 每天一次的数据库汇总(新增视频数/短视频/缺经纬度)
       4) 每天一次的元数据补全(duration/GPS缺失的视频重新提取一遍，主要用来
          补"扫盘时SRT文件还没复制完"导致的GPS缺失)
-      5) 每周一次的本地文件完整性检查(videos表活记录对应的本地文件是不是
+      5) 每3天一次的本地文件完整性检查(videos表活记录对应的本地文件是不是
          真的还在，不限于走阿里云同步进来的那部分；发现缺失只按文件夹粒度
          报一条飞书，不自动修复)
 """
@@ -83,10 +83,15 @@ async def lifespan(app: FastAPI):
         scheduled_aliyun_scan, "interval", hours=ALIYUN_SCAN_INTERVAL_HOURS,
         id="aliyun_scan", next_run_time=now,
     )
-    # 每周检查一次本地文件完整性(videos表活记录对应的文件是不是真的还在磁盘
-    # 上)，不需要next_run_time=now立刻跑——这是低紧迫度的周期健康检查，
-    # 不是"有变化要立刻处理"那类任务，没必要在每次服务重启时都额外跑一次
-    scheduler.add_job(scheduled_check_missing_files, "interval", weeks=1, id="check_missing_files")
+    # 每3天检查一次本地文件完整性(videos表活记录对应的文件是不是真的还在磁盘
+    # 上)，next_run_time=now让每次服务重启都立刻跑一次，不用傻等一整个间隔
+    # (2026-11-09: 发现这里之前漏了next_run_time=now，导致重启后要等满7天
+    # 才跑第一次，南宁xuchaoshun文件夹的"本地文件被覆盖"问题因此一直没被
+    # 这个检查发现过；顺手把间隔从7天缩到3天)
+    scheduler.add_job(
+        scheduled_check_missing_files, "interval", days=3,
+        id="check_missing_files", next_run_time=now,
+    )
     scheduler.start()
     # 飞书LLM问答机器人(长连接)：传当前正在跑的主loop进去，因为这个机器人
     # 在自己专门开的线程里跑，查数据库/调agent那部分要弹回这个主loop执行，
