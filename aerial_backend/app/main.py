@@ -13,7 +13,7 @@
 """
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
@@ -84,13 +84,19 @@ async def lifespan(app: FastAPI):
         id="aliyun_scan", next_run_time=now,
     )
     # 每3天检查一次本地文件完整性(videos表活记录对应的文件是不是真的还在磁盘
-    # 上)，next_run_time=now让每次服务重启都立刻跑一次，不用傻等一整个间隔
-    # (2026-11-09: 发现这里之前漏了next_run_time=now，导致重启后要等满7天
+    # 上)，next_run_time让每次服务重启都很快跑一次，不用傻等一整个间隔
+    # (2026-11-09: 发现这里之前漏了next_run_time，导致重启后要等满7天
     # 才跑第一次，南宁xuchaoshun文件夹的"本地文件被覆盖"问题因此一直没被
     # 这个检查发现过；顺手把间隔从7天缩到3天)
+    # (2026-11-13: 最初直接用next_run_time=now，结果每次重启必报假警——
+    # 跟scan/aliyun_scan同样next_run_time=now挤在同一瞬间抢NAS/bindfs，
+    # 这是持续性拥堵(几十秒到几分钟)，不是一瞬间的抖动，check_local_file_
+    # integrity自己加的三次确认(10秒间隔)扛不住这种持续拥堵。改成延迟
+    # 10分钟启动，等前面几个重IO任务的开局那波跑完/拥堵消退再查，不跟它们
+    # 抢在同一瞬间)
     scheduler.add_job(
         scheduled_check_missing_files, "interval", days=3,
-        id="check_missing_files", next_run_time=now,
+        id="check_missing_files", next_run_time=now + timedelta(minutes=10),
     )
     scheduler.start()
     # 飞书LLM问答机器人(长连接)：传当前正在跑的主loop进去，因为这个机器人
