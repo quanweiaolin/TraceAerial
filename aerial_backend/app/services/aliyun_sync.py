@@ -736,10 +736,17 @@ async def _handle_possible_deletion(
     # is_file()"逻辑，不是另外发明一套判断方式。last_files为None(历史
     # 记录不足，连丢了哪几个文件都对比不出来)时没法查具体是哪几个文件，
     # 不升级，按原有的"告警"级别处理
+    #
+    # 2026-11-13修：这里之前一直查aliyun_download_dir(bindfs，实测比直连慢
+    # 1000倍)，跟_trigger_download早就改用aliyun_scan_dir不一致——这条
+    # 慢路径在重启瞬间(scan/aliyun_scan同时next_run_time=now抢资源)容易
+    # 查超时/变慢，被误判成"本地也丢了"，升级成不该有的严重告警。改成跟
+    # _trigger_download一样优先用aliyun_scan_dir(同一份物理文件的直连路径)
     severe = False
     if missing_entries:
+        scan_dir = settings.aliyun_scan_dir or settings.aliyun_download_dir
         locally_missing = await asyncio.to_thread(
-            _missing_local_files, folder, missing_entries, Path(settings.aliyun_download_dir)
+            _missing_local_files, folder, missing_entries, Path(scan_dir)
         )
         severe = len(locally_missing) > 0
 
@@ -838,8 +845,16 @@ async def _process_folder(session: AsyncSession, cli: PdsCli, folder: dict[str, 
         # 完全没变，这个分支以前直接return，完全没机会发现。按预期路径逐个
         # 查一下(走NAS网络IO，丢进线程池)，缺了就报警(不自动修复，见
         # _handle_local_files_missing)
+        #
+        # 2026-11-13修：同_handle_possible_deletion，查的路径改成
+        # aliyun_scan_dir(直连，跟_trigger_download一致)，不再用慢速的
+        # aliyun_download_dir(bindfs)——之前每次重启(aliyun_scan同样
+        # next_run_time=now)都固定在这几个"云端还活着"的文件夹上误报
+        # "本地文件丢失"，根因就是这条bindfs路径在重启瞬间抢资源时查询
+        # 变慢/超时，被误判成文件不存在
+        scan_dir = settings.aliyun_scan_dir or settings.aliyun_download_dir
         missing = await asyncio.to_thread(
-            _missing_local_files, folder, folder["raw_files"], Path(settings.aliyun_download_dir)
+            _missing_local_files, folder, folder["raw_files"], Path(scan_dir)
         )
         if missing:
             await _handle_local_files_missing(session, folder, missing)

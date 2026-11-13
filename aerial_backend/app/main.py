@@ -13,7 +13,7 @@
 """
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
@@ -84,19 +84,18 @@ async def lifespan(app: FastAPI):
         id="aliyun_scan", next_run_time=now,
     )
     # 每3天检查一次本地文件完整性(videos表活记录对应的文件是不是真的还在磁盘
-    # 上)，next_run_time让每次服务重启都很快跑一次，不用傻等一整个间隔
-    # (2026-11-09: 发现这里之前漏了next_run_time，导致重启后要等满7天
+    # 上)，next_run_time=now让每次服务重启都立刻跑一次，不用傻等一整个间隔
+    # (2026-11-09: 发现这里之前漏了next_run_time=now，导致重启后要等满7天
     # 才跑第一次，南宁xuchaoshun文件夹的"本地文件被覆盖"问题因此一直没被
     # 这个检查发现过；顺手把间隔从7天缩到3天)
-    # (2026-11-13: 最初直接用next_run_time=now，结果每次重启必报假警——
-    # 跟scan/aliyun_scan同样next_run_time=now挤在同一瞬间抢NAS/bindfs，
-    # 这是持续性拥堵(几十秒到几分钟)，不是一瞬间的抖动，check_local_file_
-    # integrity自己加的三次确认(10秒间隔)扛不住这种持续拥堵。改成延迟
-    # 10分钟启动，等前面几个重IO任务的开局那波跑完/拥堵消退再查，不跟它们
-    # 抢在同一瞬间)
+    # (2026-11-13: 中间一度怀疑是跟scan/aliyun_scan抢资源导致重启必报假警，
+    # 加过10分钟延迟绕开——后来查明真正病根是aliyun_sync.py那条心跳检测
+    # 走错了bindfs慢路径(已修)，跟这里的check_local_file_integrity完全是
+    # 两个独立代码路径；这个函数本身查的是直连路径，重启后立刻跑过一次，
+    # 25426条记录全部正常，没有被拥堵影响，延迟是基于错误猜测加的，去掉)
     scheduler.add_job(
         scheduled_check_missing_files, "interval", days=3,
-        id="check_missing_files", next_run_time=now + timedelta(minutes=10),
+        id="check_missing_files", next_run_time=now,
     )
     scheduler.start()
     # 飞书LLM问答机器人(长连接)：传当前正在跑的主loop进去，因为这个机器人
