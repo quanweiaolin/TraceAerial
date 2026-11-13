@@ -489,8 +489,12 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
     return job
 
 
+LOCAL_FILE_MISSING_CONFIRM_ROUNDS = 3
+LOCAL_FILE_MISSING_CONFIRM_DELAY_SECONDS = 10
+
+
 async def check_local_file_integrity(session: AsyncSession) -> None:
-    """定期健康检查(建议每周跑一次，见app/main.py的调度注册)：扫一遍videos
+    """定期健康检查(建议每3天跑一次，见app/main.py的调度注册)：扫一遍videos
     表里deleted_at IS NULL的活记录，检查storage_path对应的文件是不是还
     真的存在。只检测、只报警，不碰任何下载/重新扫描/写库操作——这类问题
     之前只能靠巧合发现(2026-10-29：backfill_video_sha1.py重新读文件时
@@ -500,7 +504,15 @@ async def check_local_file_integrity(session: AsyncSession) -> None:
 
     按"文件夹"(storage_path的直接父目录)粒度汇总成一条飞书消息，不是
     每个缺失文件单独发一条——一个文件夹丢了几十个文件只应该报一条，
-    不刷屏。"""
+    不刷屏。
+
+    2026-11-13加三次确认：第一遍扫全部活记录较慢、并发度高(32)，NAS/bindfs
+    瞬时抖动时`is_file()`会对一大批文件同时误判成False(2026-11-13真实撞到：
+    主进程重启后立刻跑这个检查，6个文件夹同时报"缺失"，人工上去挨个确认
+    全是假的，文件分毫不差地在原地)。只对第一遍发现的"疑似缺失"候选做
+    重复确认(不是全量重跑，候选数量通常很小，代价低)，间隔
+    LOCAL_FILE_MISSING_CONFIRM_DELAY_SECONDS秒，连续
+    LOCAL_FILE_MISSING_CONFIRM_ROUNDS轮都缺失才真正当成缺失上报。"""
     result = await session.execute(select(Video.storage_path).where(Video.deleted_at.is_(None)))
     paths = [row[0] for row in result.all()]
 
@@ -511,11 +523,18 @@ async def check_local_file_integrity(session: AsyncSession) -> None:
             return await asyncio.to_thread(Path(path).is_file)
 
     exists_flags = await asyncio.gather(*(_exists(p) for p in paths))
+    candidates = [path for path, exists in zip(paths, exists_flags) if not exists]
+
+    for _ in range(LOCAL_FILE_MISSING_CONFIRM_ROUNDS - 1):
+        if not candidates:
+            break
+        await asyncio.sleep(LOCAL_FILE_MISSING_CONFIRM_DELAY_SECONDS)
+        recheck_flags = await asyncio.gather(*(_exists(p) for p in candidates))
+        candidates = [path for path, exists in zip(candidates, recheck_flags) if not exists]
 
     missing_by_folder: dict[str, int] = defaultdict(int)
-    for path, exists in zip(paths, exists_flags):
-        if not exists:
-            missing_by_folder[str(Path(path).parent)] += 1
+    for path in candidates:
+        missing_by_folder[str(Path(path).parent)] += 1
 
     if not missing_by_folder:
         print(f"[check_missing] 本地文件完整性检查：共{len(paths)}条活记录，全部正常", flush=True)
