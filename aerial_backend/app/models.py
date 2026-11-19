@@ -11,7 +11,7 @@ import enum
 from datetime import datetime
 
 from sqlalchemy import (
-    BigInteger, Boolean, DateTime, ForeignKey, Integer, LargeBinary, SmallInteger,
+    ARRAY, BigInteger, Boolean, DateTime, ForeignKey, Integer, LargeBinary, SmallInteger,
     String, Text, UniqueConstraint, func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -259,3 +259,24 @@ class AliyunFolderScan(Base):
     file_count: Mapped[int] = mapped_column(Integer)
     changed: Mapped[bool] = mapped_column(Boolean, default=False)
     files: Mapped[list | None] = mapped_column(JSONB)
+
+
+class PipelineArtifact(Base):
+    """下游各stage(感知跟踪处理/数据集生成/场景提取等，各自独立仓库、按需更新)
+    登记自己产出了什么的通用表。见 docs/superpowers/specs/
+    2026-11-16-pipeline-artifact-provenance-design.md。"""
+
+    __tablename__ = "pipeline_artifacts"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    stage_code: Mapped[str] = mapped_column(ForeignKey("pipeline_stages.code"))
+    input_video_sha256: Mapped[list[bytes]] = mapped_column(ARRAY(LargeBinary(32)))
+    code_repo: Mapped[str | None] = mapped_column(Text)
+    code_commit: Mapped[str | None] = mapped_column(Text)
+    code_dirty: Mapped[bool | None] = mapped_column(Boolean)
+    output_path: Mapped[str] = mapped_column(Text)
+    upstream_artifact_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("pipeline_artifacts.id")
+    )
+    metadata_: Mapped[dict] = mapped_column("metadata", JSONB, default=dict)
+    operator_name: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
