@@ -131,7 +131,7 @@ CREATE INDEX ON aerial.pipeline_artifacts USING gin (input_video_sha256);
 ### 学生代码（`AD_pipeline_1`）改动
 
 1. 新增一个**完全自包含、零相对import**的客户端模块（建议放在
-   `nds_code/utils/artifact_registration.py`，只用标准库——这样它就是
+   `aerial_backend/tools/artifact_registration.py`，只用标准库——这样它就是
    一个能直接丢进任意学生仓库的单文件，不依赖`nds_code`包的其他模块，
    也不依赖`config`字典里有任何特定字段。以后别的同学接入新stage，
    "安装"这件事就是：给他们这一个文件 + 一行"放哪、怎么调"的说明，
@@ -152,7 +152,7 @@ CREATE INDEX ON aerial.pipeline_artifacts USING gin (input_video_sha256);
      这次新的——不需要学生记得手动做什么，下次随便哪次pipeline跑
      起来、后端刚好恢复了，旧账自动补上。
    - 另外留一个最简单的手动补发入口（命令行跑
-     `python -m nds_code.utils.artifact_registration --retry-pending`），
+     `python -m artifact_registration --retry-pending`），
      不用等下次pipeline跑就能手动确认补发。
    - **补录古早数据用的可选参数`code_commit_override`**：正常跑pipeline
      时不传这个参数，照旧自动探测当前HEAD（见上面"代码版本来源"）。

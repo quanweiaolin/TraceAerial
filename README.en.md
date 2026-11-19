@@ -188,3 +188,84 @@ folder that's still mid-upload — this is a deliberate tradeoff of "urgent" mod
 bug, and there's no way around it. If more files show up in the cloud afterward, the
 regular automated pipeline will detect that and alert via Feishu, but there's no
 guarantee the first grab was complete.
+
+## Downstream Pipeline Artifact Registration
+
+**One-line summary**: copy the single file
+`aerial_backend/tools/artifact_registration.py` into your own repo (or
+ask an admin for it), `from artifact_registration import register_artifact`,
+and when calling it, fill in at least `stage_code` (ask an admin for this), `input_video_paths`
+(the raw video path(s) you used this run), and `output_path` (the file you produced this run).
+
+Downstream stages (perception/tracking, dataset generation, SOTIF scene
+extraction, etc.) each live in their own independently-maintained repo,
+updated on their own schedule — not a shared codebase. To know which raw
+video an artifact came from and which code version produced it, there's a
+generic registration endpoint.
+
+### Plain HTTP
+
+```bash
+curl -X POST "http://<server-address>:8088/pipeline/artifacts" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "stage_code": "ad_perception_tracking",
+    "input_video_paths": ["/mnt/Expansion2/.../xxx.MP4"],
+    "output_path": "/mnt/.../xxx_STD_TRK.csv",
+    "code_repo": "AD_pipeline_1",
+    "code_commit": "a1b2c3d...",
+    "code_dirty": false,
+    "metadata": {"detection_model": "yolov8"},
+    "operator_name": "quanwei"
+  }'
+```
+
+| Field | Required | Notes |
+|---|---|---|
+| `stage_code` | yes | Maps to `pipeline_stages.code` — ask an admin to add a row for a new stage |
+| `input_video_paths` | yes | Absolute path(s) of the raw video(s); the backend resolves sha256 via `videos.storage_path` — callers never compute a video hash themselves |
+| `output_path` | yes | Absolute path of this run's main output file/directory |
+| `code_repo`/`code_commit`/`code_dirty` | no | Code version info |
+| `metadata` | no | Free-form JSON for whatever the stage wants to record (model used, param fingerprint, etc.) |
+| `operator_name` | no | Who ran it |
+
+If even one path in `input_video_paths` doesn't resolve against `videos`,
+the whole request 422s, naming the offending path(s) — never a half-done
+state where some videos registered and others didn't.
+
+### Python client (for `nds_code`-style student repos)
+
+`aerial_backend/tools/artifact_registration.py` is a single, fully self-contained
+file (stdlib only, no dependencies to install) — copy it into your own
+repo and call it:
+
+```python
+from artifact_registration import register_artifact
+
+register_artifact(
+    "ad_perception_tracking",
+    [raw_video_path],
+    output_path,
+    {"detection_model": "yolov8"},
+)
+```
+
+The git commit is auto-detected at call time — you don't pass it
+yourself. A network/backend outage never raises or interrupts your
+pipeline: the failed request is appended to a local pending-retry file
+(`~/.aerial_pipeline/pending_artifacts.jsonl`), and every subsequent
+`register_artifact` call tries to flush it first — nothing to remember to
+do manually. You can also run
+`python -m artifact_registration --retry-pending` to flush
+it on demand.
+
+**Backfilling old data produced before this feature existed**: for a
+normal call, don't pass `code_commit_override` (it auto-detects the
+current code version). For genuinely old data where nobody remembers the
+commit, pass `code_commit_override=None` explicitly rather than guessing
+— this honestly leaves the code version blank instead of silently filling
+in "whatever's checked out right now" (which would be misleading, not
+just imprecise). If you roughly remember a commit (even just the first
+few characters), pass that — it's resolved and verified via git's own
+short-hash resolution; if it doesn't resolve, a warning is logged and the
+field is left blank, but the artifact still registers.

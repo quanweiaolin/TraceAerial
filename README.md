@@ -171,3 +171,75 @@ curl -X POST "http://<服务器地址>:8088/aliyun/urgent-download?session_name=
 传完的数据——这是"紧急"模式主动接受的代价，不是bug，没有别的办法规避。
 如果云端之后又有新文件传上来，常规的自动化流程会检测到并发飞书提醒，但
 没法保证第一次抓到的这一份就是完整的。
+
+## 下游Pipeline产物登记
+
+**一句话说明**：把`aerial_backend/tools/artifact_registration.py`
+这一个文件复制到自己仓库里（或者找管理员要），`from artifact_registration import register_artifact`，
+调用时至少填好`stage_code`（找管理员要）、`input_video_paths`（你这次用到的原始视频路径）、
+`output_path`（你这次产出的文件路径）这三项。
+
+下游各stage（感知跟踪处理、数据集生成、SOTIF场景提取等）各自是独立仓库、
+按需更新，不是统一代码库。为了知道"某个产物源自哪个原始视频、是哪个代码
+版本产出的"，加了一个通用的登记接口。
+
+### 直接发HTTP请求
+
+```bash
+curl -X POST "http://<服务器地址>:8088/pipeline/artifacts" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "stage_code": "ad_perception_tracking",
+    "input_video_paths": ["/mnt/Expansion2/.../xxx.MP4"],
+    "output_path": "/mnt/.../xxx_STD_TRK.csv",
+    "code_repo": "AD_pipeline_1",
+    "code_commit": "a1b2c3d...",
+    "code_dirty": false,
+    "metadata": {"detection_model": "yolov8"},
+    "operator_name": "quanwei"
+  }'
+```
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `stage_code` | 是 | 对应`pipeline_stages.code`，需要新stage先找管理员加一行 |
+| `input_video_paths` | 是 | 原始视频的绝对路径（一个或多个），后端按`videos.storage_path`反查sha256——不用自己算视频哈希 |
+| `output_path` | 是 | 这次产出的主文件/目录绝对路径 |
+| `code_repo`/`code_commit`/`code_dirty` | 否 | 代码版本信息 |
+| `metadata` | 否 | 不定schema，stage自己的东西（用了哪个模型、参数指纹等）都塞这里 |
+| `operator_name` | 否 | 谁跑的 |
+
+`input_video_paths`里只要有一个路径在`videos`表查不到，整个请求返回
+`422`并点名哪些路径不对——不会出现"部分视频登记上、部分没登记上"这种
+半成品状态。
+
+### Python客户端（给`nds_code`风格的学生仓库用）
+
+`aerial_backend/tools/artifact_registration.py`是一个完全自包含的单文件（只用
+标准库，不需要装任何依赖），复制到自己仓库里就能用：
+
+```python
+from artifact_registration import register_artifact
+
+register_artifact(
+    "ad_perception_tracking",
+    [raw_video_path],
+    output_path,
+    {"detection_model": "yolov8"},
+)
+```
+
+代码版本（git commit）会在调用那一刻自动探测，不用自己传。网络/后端
+暂时连不上也不会报错中断你的pipeline——会自动写进本地一个待重试文件
+（`~/.aerial_pipeline/pending_artifacts.jsonl`），下次随便哪次调用
+`register_artifact`都会先尝试把这些补发出去，不需要记得手动做什么；
+也可以手动跑`python -m artifact_registration --retry-pending`
+立刻确认补发。
+
+**补录以前已经产出、这次只是事后登记的老数据**：正常调用不用传
+`code_commit_override`（自动探测当前代码版本）；如果是很早以前的数据，
+谁都想不起来当时用的是哪个commit了，显式传`code_commit_override=None`，
+不要瞎猜——会诚实地把代码版本留空，不会偷偷填成"现在"的版本（那是误导，
+不是不精确）。如果还记得个大概（哪怕只是前几位），直接传那个值，内部
+会用git自带的短hash解析校验+补全，解析不出来就警告+留空，但不会阻止
+这条产物正常注册。

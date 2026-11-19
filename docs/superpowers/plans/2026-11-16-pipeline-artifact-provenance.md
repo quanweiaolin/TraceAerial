@@ -37,16 +37,16 @@
 
 ## 文件结构
 
-**`aerial_backend/`（后端）：**
+**`aerial_backend/`（咱们自己的仓库）：**
 - `add_pipeline_artifacts.sql`（新建，放在仓库根目录，跟现有的那些`add_*.sql`文件放一起）——`CREATE TABLE pipeline_artifacts` + 给`ad_perception_tracking`插入一条种子`pipeline_stages`记录。
 - `app/models.py`（修改）——加`PipelineArtifact`这个ORM类。
 - `app/api/routers/pipeline_artifacts.py`（新建）——`POST /pipeline/artifacts`：请求/响应的Pydantic模型，路径→sha256的反查逻辑，插入。
 - `app/main.py`（修改）——加import + `include_router`。
+- `tools/artifact_registration.py`（新建）——`detect_git_info(start_path: Path) -> tuple[str | None, bool | None]`，`register_artifact(stage_code: str, input_video_paths: list[str], output_path: str, metadata: dict, *, backend_base_url: str = DEFAULT_BACKEND_BASE_URL, pending_file: Path | None = None, code_commit_override: str | None = _UNSET) -> None`（`code_commit_override`用哨兵默认值区分"没传"(自动探测)和"显式传None"(补录古早数据，留空不猜)），外加一个本地待重试队列（`DEFAULT_PENDING_FILE`、`_flush_pending`）和一个`--retry-pending`命令行入口——完全自包含（只用标准库，不import任何其他模块）。**这个文件不放进`extern/AD_pipeline_1`**（那是外来的学生仓库，等同`extern/pds-drive-sync`的处理方式，不往里面塞我们自己的文件）——它是我们自己维护、按需复制/发给学生的工具，放在我们自己仓库里。
+- `tools/tests/test_artifact_registration.py`（新建）——`unittest`写的测试，覆盖`detect_git_info`（真实的临时git仓库）和`register_artifact`的错误处理+待重试逻辑（mock掉`urllib`）。
 
-**`extern/AD_pipeline_1/`（学生仓库）：**
-- `nds_code/utils/artifact_registration.py`（新建）——`detect_git_info(start_path: Path) -> tuple[str | None, bool | None]`，`register_artifact(stage_code: str, input_video_paths: list[str], output_path: str, metadata: dict, *, backend_base_url: str = DEFAULT_BACKEND_BASE_URL, pending_file: Path | None = None, code_commit_override: str | None = _UNSET) -> None`（`code_commit_override`用哨兵默认值区分"没传"(自动探测)和"显式传None"(补录古早数据，留空不猜)），外加一个本地待重试队列（`DEFAULT_PENDING_FILE`、`_flush_pending`）和一个`--retry-pending`命令行入口——完全自包含（只用标准库，不import任何`nds_code.*`模块），可以原样丢进其他同学的仓库。
-- `nds_code/tests/test_artifact_registration.py`（新建）——`unittest`写的测试，覆盖`detect_git_info`（真实的临时git仓库）和`register_artifact`的错误处理+待重试逻辑（mock掉`urllib`）。
-- `nds_code/main.py`（修改）——在`standardized_output`那段代码之后加一次`register_artifact(...)`调用。
+**`extern/AD_pipeline_1/`（学生仓库，这次实现不改动它）：**
+- Task 5描述的那一行`register_artifact(...)`调用，是**说明给学生的改法**（发给学生，由他自己加进他自己的仓库），不是我们直接commit进这份本地下载的快照里。
 
 ---
 
@@ -198,14 +198,14 @@ git commit -m "feat: add POST /pipeline/artifacts endpoint"
 
 ---
 
-### Task 4: `AD_pipeline_1`客户端helper——git探测 + 注册调用 + 待重试队列
+### Task 4: 客户端helper——git探测 + 注册调用 + 待重试队列
 
 **Files:**
-- Create: `extern/AD_pipeline_1/nds_code/utils/artifact_registration.py`
-- Test: `extern/AD_pipeline_1/nds_code/tests/test_artifact_registration.py`
+- Create: `aerial_backend/tools/artifact_registration.py`（咱们自己仓库里，不是学生仓库——见"文件结构"）
+- Test: `aerial_backend/tools/tests/test_artifact_registration.py`
 
 **Interfaces:**
-- Produces: `_GIT_SEARCH_ROOT = Path(__file__)`（模块级常量，`detect_git_info`/`_resolve_commit_override`默认的起点；测试通过`mock.patch('nds_code.utils.artifact_registration._GIT_SEARCH_ROOT', <tmp repo里的某个文件>)`来控制"当前代码仓库"指向哪，不需要真的搬动这个源文件）；`detect_git_info(start_path: Path) -> tuple[str | None, bool | None]`（返回`(commit_hash, is_dirty)`；如果`start_path`往上找不到任何`.git`目录，返回`(None, None)`）；`_UNSET`（模块级哨兵对象，`object()`即可，用来在`code_commit_override`上区分"没传这个参数"和"显式传了`None`"）；`_resolve_commit_override(value: str, start_path: Path) -> str | None`（用`git rev-parse --verify <value>^{commit}`解析，成功返回完整40位hash，失败返回`None`）；`register_artifact(stage_code: str, input_video_paths: list[str], output_path: str, metadata: dict, *, backend_base_url: str = "http://127.0.0.1:8088", pending_file: Path | None = None, code_commit_override: str | None = _UNSET) -> None`（永不抛异常；任何失败都只记日志然后返回；`pending_file`默认是`DEFAULT_PENDING_FILE`，只有测试会覆盖这个默认值；`code_commit_override`不传时走`detect_git_info`自动探测当前HEAD——跟以前行为一致；显式传`None`表示补录古早数据、不知道commit、不要猜，`code_commit`/`code_dirty`都留空；传一个字符串就走`_resolve_commit_override`解析，解析成功只填`code_commit`、`code_dirty`留空，解析失败记warning并同样留空，不阻止注册）；`DEFAULT_PENDING_FILE = Path.home() / ".aerial_pipeline" / "pending_artifacts.jsonl"`；一个`python -m nds_code.utils.artifact_registration --retry-pending`命令行入口。
+- Produces: `_GIT_SEARCH_ROOT = Path(__file__)`（模块级常量，`detect_git_info`/`_resolve_commit_override`默认的起点；测试通过`mock.patch('artifact_registration._GIT_SEARCH_ROOT', <tmp repo里的某个文件>)`来控制"当前代码仓库"指向哪，不需要真的搬动这个源文件）；`detect_git_info(start_path: Path) -> tuple[str | None, bool | None]`（返回`(commit_hash, is_dirty)`；如果`start_path`往上找不到任何`.git`目录，返回`(None, None)`）；`_UNSET`（模块级哨兵对象，`object()`即可，用来在`code_commit_override`上区分"没传这个参数"和"显式传了`None`"）；`_resolve_commit_override(value: str, start_path: Path) -> str | None`（用`git rev-parse --verify <value>^{commit}`解析，成功返回完整40位hash，失败返回`None`）；`register_artifact(stage_code: str, input_video_paths: list[str], output_path: str, metadata: dict, *, backend_base_url: str = "http://127.0.0.1:8088", pending_file: Path | None = None, code_commit_override: str | None = _UNSET) -> None`（永不抛异常；任何失败都只记日志然后返回；`pending_file`默认是`DEFAULT_PENDING_FILE`，只有测试会覆盖这个默认值；`code_commit_override`不传时走`detect_git_info`自动探测当前HEAD——跟以前行为一致；显式传`None`表示补录古早数据、不知道commit、不要猜，`code_commit`/`code_dirty`都留空；传一个字符串就走`_resolve_commit_override`解析，解析成功只填`code_commit`、`code_dirty`留空，解析失败记warning并同样留空，不阻止注册）；`DEFAULT_PENDING_FILE = Path.home() / ".aerial_pipeline" / "pending_artifacts.jsonl"`；一个`python -m artifact_registration --retry-pending`命令行入口。
 - Consumes: 只用标准库（`subprocess`、`urllib.request`、`urllib.error`、`json`、`logging`、`pathlib.Path`、`argparse`）——不新增依赖（`nds_code/requirements.txt`里没有`requests`），不import任何其他`nds_code`模块。
 
 - [ ] **Step 1: 在`nds_code/tests/test_artifact_registration.py`里写失败的测试**
@@ -219,7 +219,7 @@ import urllib.error
 from pathlib import Path
 from unittest import mock
 
-from nds_code.utils.artifact_registration import detect_git_info, register_artifact
+from artifact_registration import detect_git_info, register_artifact
 
 
 class TestDetectGitInfo(unittest.TestCase):
@@ -264,13 +264,13 @@ class TestRegisterArtifact(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    @mock.patch('nds_code.utils.artifact_registration.urlopen')
+    @mock.patch('artifact_registration.urlopen')
     def test_backend_unreachable_does_not_raise(self, mock_urlopen):
         mock_urlopen.side_effect = OSError('connection refused')
         register_artifact('ad_perception_tracking', ['/a.MP4'], '/b.csv', {},
                            pending_file=self.pending_file)  # 不能抛异常
 
-    @mock.patch('nds_code.utils.artifact_registration.urlopen')
+    @mock.patch('artifact_registration.urlopen')
     def test_network_error_appends_to_pending_file(self, mock_urlopen):
         mock_urlopen.side_effect = OSError('connection refused')
         register_artifact('ad_perception_tracking', ['/a.MP4'], '/b.csv', {},
@@ -279,19 +279,19 @@ class TestRegisterArtifact(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         self.assertEqual(json.loads(lines[0])['output_path'], '/b.csv')
 
-    @mock.patch('nds_code.utils.artifact_registration.urlopen')
+    @mock.patch('artifact_registration.urlopen')
     def test_422_logs_error_and_is_not_added_to_pending(self, mock_urlopen):
         mock_urlopen.side_effect = urllib.error.HTTPError('url', 422, 'Unprocessable', {}, None)
-        with self.assertLogs('nds_code.utils.artifact_registration', level='ERROR') as log_ctx:
+        with self.assertLogs('artifact_registration', level='ERROR') as log_ctx:
             register_artifact('ad_perception_tracking', ['/a.MP4'], '/b.csv', {},
                                pending_file=self.pending_file)
         self.assertTrue(any('422' in m or 'Unprocessable' in m for m in log_ctx.output))
         self.assertFalse(self.pending_file.exists())
 
-    @mock.patch('nds_code.utils.artifact_registration.urlopen')
+    @mock.patch('artifact_registration.urlopen')
     def test_network_error_logs_below_error_level(self, mock_urlopen):
         mock_urlopen.side_effect = OSError('timeout')
-        with self.assertLogs('nds_code.utils.artifact_registration') as log_ctx:
+        with self.assertLogs('artifact_registration') as log_ctx:
             register_artifact('ad_perception_tracking', ['/a.MP4'], '/b.csv', {},
                                pending_file=self.pending_file)
         self.assertFalse(any(r.levelname == 'ERROR' for r in log_ctx.records))
@@ -302,7 +302,7 @@ class TestRegisterArtifact(unittest.TestCase):
             'stage_code': 'ad_perception_tracking', 'input_video_paths': ['/old.MP4'],
             'output_path': '/old.csv', 'metadata': {},
         }) + '\n')
-        with mock.patch('nds_code.utils.artifact_registration.urlopen') as mock_urlopen:
+        with mock.patch('artifact_registration.urlopen') as mock_urlopen:
             mock_urlopen.return_value.__enter__.return_value.read.return_value = b'{"id": 1}'
             register_artifact('ad_perception_tracking', ['/new.MP4'], '/new.csv', {},
                                pending_file=self.pending_file)
@@ -330,7 +330,7 @@ class TestCodeCommitOverride(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_no_override_autodetects_current_head(self):
-        with mock.patch('nds_code.utils.artifact_registration.urlopen') as mock_urlopen:
+        with mock.patch('artifact_registration.urlopen') as mock_urlopen:
             captured = {}
             def fake_urlopen(request, timeout=None):
                 captured['body'] = json.loads(request.data)
@@ -338,13 +338,13 @@ class TestCodeCommitOverride(unittest.TestCase):
                 cm.__enter__.return_value.read.return_value = b'{"id": 1}'
                 return cm
             mock_urlopen.side_effect = fake_urlopen
-            with mock.patch('nds_code.utils.artifact_registration._GIT_SEARCH_ROOT', self.repo):
+            with mock.patch('artifact_registration._GIT_SEARCH_ROOT', self.repo):
                 register_artifact('ad_perception_tracking', ['/a.MP4'], '/b.csv', {},
                                    pending_file=self.pending_file)
         self.assertEqual(captured['body']['code_commit'], self.real_commit)
 
     def test_explicit_none_override_leaves_commit_and_dirty_blank(self):
-        with mock.patch('nds_code.utils.artifact_registration.urlopen') as mock_urlopen:
+        with mock.patch('artifact_registration.urlopen') as mock_urlopen:
             captured = {}
             def fake_urlopen(request, timeout=None):
                 captured['body'] = json.loads(request.data)
@@ -359,7 +359,7 @@ class TestCodeCommitOverride(unittest.TestCase):
 
     def test_resolvable_short_hash_override_fills_full_commit(self):
         short_hash = self.real_commit[:8]
-        with mock.patch('nds_code.utils.artifact_registration.urlopen') as mock_urlopen:
+        with mock.patch('artifact_registration.urlopen') as mock_urlopen:
             captured = {}
             def fake_urlopen(request, timeout=None):
                 captured['body'] = json.loads(request.data)
@@ -367,19 +367,19 @@ class TestCodeCommitOverride(unittest.TestCase):
                 cm.__enter__.return_value.read.return_value = b'{"id": 1}'
                 return cm
             mock_urlopen.side_effect = fake_urlopen
-            with mock.patch('nds_code.utils.artifact_registration._GIT_SEARCH_ROOT', self.repo):
+            with mock.patch('artifact_registration._GIT_SEARCH_ROOT', self.repo):
                 register_artifact('ad_perception_tracking', ['/a.MP4'], '/b.csv', {},
                                    pending_file=self.pending_file, code_commit_override=short_hash)
         self.assertEqual(captured['body']['code_commit'], self.real_commit)
         self.assertIsNone(captured['body']['code_dirty'])
 
     def test_unresolvable_override_warns_and_still_registers(self):
-        with mock.patch('nds_code.utils.artifact_registration.urlopen') as mock_urlopen:
+        with mock.patch('artifact_registration.urlopen') as mock_urlopen:
             cm = mock.MagicMock()
             cm.__enter__.return_value.read.return_value = b'{"id": 1}'
             mock_urlopen.return_value = cm
-            with mock.patch('nds_code.utils.artifact_registration._GIT_SEARCH_ROOT', self.repo):
-                with self.assertLogs('nds_code.utils.artifact_registration', level='WARNING'):
+            with mock.patch('artifact_registration._GIT_SEARCH_ROOT', self.repo):
+                with self.assertLogs('artifact_registration', level='WARNING'):
                     register_artifact('ad_perception_tracking', ['/a.MP4'], '/b.csv', {},
                                        pending_file=self.pending_file,
                                        code_commit_override='not-a-real-hash')
@@ -389,13 +389,13 @@ class TestCodeCommitOverride(unittest.TestCase):
 - [ ] **Step 2: 跑测试，确认它们会失败**
 
 Run: `cd extern/AD_pipeline_1 && PYTHONDONTWRITEBYTECODE=1 python -B -m unittest nds_code.tests.test_artifact_registration -v`
-Expected: `ModuleNotFoundError: No module named 'nds_code.utils.artifact_registration'`
+Expected: `ModuleNotFoundError: No module named 'artifact_registration'`
 
 - [ ] **Step 3: 实现`detect_git_info`、`register_artifact`、以及待重试文件的补发逻辑**
 
 `detect_git_info(start_path)`：从`start_path.parent`开始往上找`.git`目录（不要依赖`cwd`）；找不到就返回`(None, None)`。找到了就以这个仓库根目录为`cwd`跑`git rev-parse HEAD`和`git status --porcelain`（`capture_output=True`、`text=True`、`timeout=5`）；`is_dirty`就是`bool(status_output.strip())`。整个函数体包在`try/except (OSError, subprocess.SubprocessError)`里，任何失败都返回`(None, None)`——git不存在或者行为异常绝不能让调用方崩溃。
 
-一个私有的`_post(payload: dict, backend_base_url: str) -> None`负责真正发请求：`urllib.request.Request(f'{backend_base_url}/pipeline/artifacts', data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json'}, method='POST')` + `urlopen(request, timeout=10)`（要直接`from urllib.request import urlopen`这样import，这样测试里的`mock.patch('nds_code.utils.artifact_registration.urlopen')`才能生效），异常原样往外抛——由调用方决定怎么处理`urllib.error.HTTPError`和其他异常。
+一个私有的`_post(payload: dict, backend_base_url: str) -> None`负责真正发请求：`urllib.request.Request(f'{backend_base_url}/pipeline/artifacts', data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json'}, method='POST')` + `urlopen(request, timeout=10)`（要直接`from urllib.request import urlopen`这样import，这样测试里的`mock.patch('artifact_registration.urlopen')`才能生效），异常原样往外抛——由调用方决定怎么处理`urllib.error.HTTPError`和其他异常。
 
 一个私有的`_flush_pending(pending_file: Path, backend_base_url: str) -> None`：如果`pending_file`不存在就直接返回。否则逐行读取，每一行尝试`_post(json.loads(line), backend_base_url)`：成功就丢掉这一行；如果是`HTTPError`且`code == 422`，记一条`logger.error(...)`然后也丢掉这一行（重试也没用）；其他任何异常就保留这一行（还是pending状态），并且这次调用就不再往下尝试剩下的行了（保持顺序，避免对着一个还没恢复的后端反复发请求）。最后把`pending_file`重写成只剩下还pending的那些行，如果一行都不剩就直接删掉这个文件。
 
@@ -418,7 +418,7 @@ Expected: `OK`（12个测试）。
 - [ ] **Step 5: Commit**
 
 ```bash
-git add nds_code/utils/artifact_registration.py nds_code/tests/test_artifact_registration.py
+git add aerial_backend/tools/artifact_registration.py nds_code/tests/test_artifact_registration.py
 git commit -m "feat: add register_artifact client helper with self-contained git detection and pending-retry queue"
 ```
 
@@ -426,16 +426,18 @@ git commit -m "feat: add register_artifact client helper with self-contained git
 
 ### Task 5: 把这一处注册调用接进`main.py`
 
+**这是交给学生自己改的说明，不是我们在本地那份`extern/AD_pipeline_1`快照里执行的步骤**——那是学生自己的仓库（等同`extern/pds-drive-sync`的外来仓库处理方式），我们不往里面提交改动。下面的"Files"是指学生仓库里的文件。
+
 **Files:**
-- Modify: `extern/AD_pipeline_1/nds_code/main.py:1610`（紧接在现有的`logger.info(f'[{video_name}] [GPU{gpu_id}] 标准化输出完成: {std_trk_path}')`这一行之后，仍在`if run_func.get('standardized_output'):`这个代码块内，`check_shutdown('standardized_output_done')`之前）
+- Modify（学生自己操作）: `nds_code/main.py:1610`（紧接在现有的`logger.info(f'[{video_name}] [GPU{gpu_id}] 标准化输出完成: {std_trk_path}')`这一行之后，仍在`if run_func.get('standardized_output'):`这个代码块内，`check_shutdown('standardized_output_done')`之前）
 
 **Interfaces:**
-- Consumes: Task 4的`register_artifact`（来自`nds_code.utils.artifact_registration`）；`config['raw_single_video_path']`、`std_trk_path`、`meta_path`（根据设计阶段读过的代码，这几个变量在插入点已经在作用域内）。
+- Consumes: Task 4的`register_artifact`（来自`artifact_registration`）；`config['raw_single_video_path']`、`std_trk_path`、`meta_path`（根据设计阶段读过的代码，这几个变量在插入点已经在作用域内）。
 
 - [ ] **Step 1: 在`main.py`靠前的位置加上import**（跟这个函数内部其他`from nds_code.utils...`的import放一起，比如紧跟在第1597行那个现有的`from nds_code.utils.step3_postprocess.standardize_output import generate_standardized_output`之后）
 
 ```python
-from nds_code.utils.artifact_registration import register_artifact
+from artifact_registration import register_artifact
 ```
 
 - [ ] **Step 2: 加这次调用**
