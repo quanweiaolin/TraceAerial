@@ -1,3 +1,6 @@
 [submodule "extern/pds-drive-sync"]
 	path = extern/pds-drive-sync
 	url = https://github.com/zzi4/pds-drive-sync.git
+[submodule "extern/AD_pipeline_1"]
+	path = extern/AD_pipeline_1
+	url = https://github.com/ADSafetyTeam/ADSafety.git
