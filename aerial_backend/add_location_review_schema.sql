@@ -1,3 +1,9 @@
+-- 2026-11-25加：这份迁移必须在重启跑这份代码的app进程之前执行完。
+-- app/models.py这次给videos/locations/operators三张表新增了ORM映射列
+-- (location_confirmed等)，一旦新代码跑起来而这几列还不存在，针对这几张
+-- 表的任何查询(包括跟这次改动完全无关的现有接口)都会因为
+-- UndefinedColumnError直接报错，不是只影响地址复核相关的新接口。
+
 SET search_path TO aerial, public;
 
 CREATE TABLE IF NOT EXISTS location_groups (
@@ -55,3 +61,10 @@ CREATE TABLE IF NOT EXISTS location_change_history (
     changed_at  timestamptz NOT NULL DEFAULT now(),
     reason      text
 );
+
+CREATE INDEX IF NOT EXISTS idx_location_review_items_status
+    ON location_review_items (status);
+CREATE INDEX IF NOT EXISTS idx_location_review_items_video_sha256
+    ON location_review_items (video_sha256);
+CREATE INDEX IF NOT EXISTS idx_location_change_history_entity
+    ON location_change_history (entity_type, entity_id, field_name);
