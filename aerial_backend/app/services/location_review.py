@@ -22,6 +22,7 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.models import Location, LocationGroup, LocationReviewItem, Video
 from app.services.hashing import sha256_bytes_to_hex
 from app.services.location_history import record_change
@@ -92,16 +93,26 @@ async def apply_human_decision(
         ValueError("different_location不应该带target_location_id")；
         video.location_id保持原值不变(可能还是NULL，也可能是别的待定
         值，这个决策只是否定了"是这个候选"，不代表已经确定是别的某个
-        地点)。
+        地点)。**这个分支不会锁定视频**(2026-11-25修——见Finding C2：
+        之前这里统一设置video.location_confirmed=True，导致"否定这个
+        候选"的决策把视频永久锁死在一个NULL/未定的location_id上，而且
+        没有任何解锁入口，同一视频其它待复核item会全部变成永久409。
+        只否定了一个候选，不代表地址已经确定，不该上锁)——只标记这条
+        item本身为decided，不动video的任何锁定字段。
 
     已经location_confirmed=true的视频直接
     ValueError("视频地址已锁定，需先解锁")。
 
+    target_location_id必须指向一个真实存在的Location，否则在任何写入
+    发生之前就ValueError(f"location_id={target_location_id}不存在")
+    (Finding C3a：以前这里直接赋值，等commit时才因为FK约束炸出
+    IntegrityError，变成500而不是干净的409)。
+
     成功后：same_location/new_location两种情况下设置
-    video.location_id=target_location_id；三种情况下都设置
-    video.location_confirmed=True、location_confirmed_by/_at；调
-    record_change记录涉及字段的变更(location_id变了才记一条，
-    location_confirmed总是要记一条)。
+    video.location_id=target_location_id、video.location_confirmed=
+    True、location_confirmed_by/_at(只有这两种情况才真正"锁定"视频，
+    见上面C2的说明)；调record_change记录涉及字段的变更(location_id变
+    了才记一条，location_confirmed总是要记一条)。
 
     反向回填截图：decision是same_location或new_location且
     target_location_id对应的Location.representative_frame_path当前
@@ -128,10 +139,19 @@ async def apply_human_decision(
     if video.location_confirmed:
         raise ValueError("视频地址已锁定，需先解锁")
 
+    target_location: Location | None = None
+    if decision in ("same_location", "new_location"):
+        # 存在性校验必须在任何session.add/属性赋值之前做，否则一个不存在
+        # 的target_location_id会一路拖到commit()才炸IntegrityError(500)，
+        # 而不是这里干净地409(Finding C3a)。
+        target_location = await session.get(Location, target_location_id)
+        if target_location is None:
+            raise ValueError(f"location_id={target_location_id}不存在")
+
     now = datetime.now(timezone.utc)
 
-    old_location_id = video.location_id
     if decision in ("same_location", "new_location"):
+        old_location_id = video.location_id
         if old_location_id != target_location_id:
             record_change(
                 session,
@@ -145,19 +165,21 @@ async def apply_human_decision(
             )
             video.location_id = target_location_id
 
-    record_change(
-        session,
-        entity_type="video",
-        entity_id=sha256_bytes_to_hex(video.sha256),
-        field_name="location_confirmed",
-        old_value=str(video.location_confirmed),
-        new_value=str(True),
-        changed_by=operator_id,
-        reason=reason,
-    )
-    video.location_confirmed = True
-    video.location_confirmed_by = operator_id
-    video.location_confirmed_at = now
+        record_change(
+            session,
+            entity_type="video",
+            entity_id=sha256_bytes_to_hex(video.sha256),
+            field_name="location_confirmed",
+            old_value=str(video.location_confirmed),
+            new_value=str(True),
+            changed_by=operator_id,
+            reason=reason,
+        )
+        video.location_confirmed = True
+        video.location_confirmed_by = operator_id
+        video.location_confirmed_at = now
+    # decision == "different_location"：不碰video的任何字段，只否定了
+    # 这一个候选，视频保持未锁定、其它pending item仍然可以正常被决策。
 
     item.human_decision = decision
     item.decided_by = operator_id
@@ -165,7 +187,6 @@ async def apply_human_decision(
     item.status = "decided"
 
     if decision in ("same_location", "new_location") and item.screenshot_path:
-        target_location = await session.get(Location, target_location_id)
         if target_location is not None and target_location.representative_frame_path is None:
             record_change(
                 session,
@@ -181,6 +202,83 @@ async def apply_human_decision(
 
     await session.commit()
     return item
+
+
+async def unlock_video(
+    session: AsyncSession, video_sha256: bytes, operator_id: int, reason: str
+) -> None:
+    """解锁一条被人工锁定(location_confirmed=true)的视频(Finding C2b)：
+    之前`different_location`决策误把视频锁死又没有任何解锁入口，这个
+    函数补上那个缺口——把location_confirmed重置为False、清空
+    location_confirmed_by/_at，让这条视频重新能进入复核/聚类流程。视频
+    本来就没被锁定时直接ValueError，不是"幂等地什么都不做"：解锁一个
+    没锁的视频几乎总是调用方逻辑错误，显式报错比静默忽略更安全。"""
+    video = await session.get(Video, video_sha256)
+    if video is None:
+        raise ValueError("视频不存在")
+    if not video.location_confirmed:
+        raise ValueError("视频地址未锁定，无需解锁")
+
+    record_change(
+        session,
+        entity_type="video",
+        entity_id=sha256_bytes_to_hex(video.sha256),
+        field_name="location_confirmed",
+        old_value="True",
+        new_value="False",
+        changed_by=operator_id,
+        reason=reason,
+    )
+    video.location_confirmed = False
+    video.location_confirmed_by = None
+    video.location_confirmed_at = None
+
+    await session.commit()
+
+
+async def create_new_location(
+    session: AsyncSession, city: str, site_prefix: str, operator_id: int
+) -> Location:
+    """人工复核时确认"这是个全新地点"，建一条新的Location行(Finding
+    C3b)：命名/序号计算跟scanner.py的_assign_city_site新建地址时完全
+    同一套逻辑(同city+同site_prefix前缀下递增序号，不同前缀各自独立
+    计数)，复用是为了以后两边遇到同一个(city, site_prefix)组合时不会
+    算出互相冲突的序号。threshold_meters用跟自动聚类同一个配置项
+    (settings.address_cluster_max_diameter_meters)，不是另起一个独立
+    的数字——这条新location以后也可能被_assign_city_site的在线聚类拿来
+    跟后续视频比较，阈值语义必须一致。"""
+    prefix_sites_result = await session.execute(
+        select(Location.site)
+        .where(Location.city == city)
+        .where(Location.site.like(f"{site_prefix}_%"))
+    )
+    existing_indexes = [
+        int(label[len(site_prefix) + 1:])
+        for (label,) in prefix_sites_result
+        if label[len(site_prefix) + 1:].isdigit()
+    ]
+    new_site = f"{site_prefix}_{max(existing_indexes, default=0) + 1}"
+
+    new_location = Location(
+        city=city,
+        site=new_site,
+        threshold_meters=settings.address_cluster_max_diameter_meters,
+    )
+    session.add(new_location)
+    await session.flush()  # 拿到new_location.id
+
+    record_change(
+        session,
+        entity_type="location",
+        entity_id=str(new_location.id),
+        field_name="created",
+        old_value=None,
+        new_value=f"{city}/{new_site}",
+        changed_by=operator_id,
+    )
+
+    await session.commit()
+    return new_location
 
 
 async def merge_location_groups(
