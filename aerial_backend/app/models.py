@@ -38,7 +38,8 @@ class Operator(Base):
     display_name: Mapped[str | None] = mapped_column(String(64))
     role: Mapped[str | None] = mapped_column(String(32))
     dept: Mapped[str | None] = mapped_column(String(64))
-    
+    can_review_location: Mapped[bool] = mapped_column(Boolean, default=False)
+
 class Device(Base):
     __tablename__ = "devices"
     device_id: Mapped[int] = mapped_column(primary_key=True)
@@ -108,6 +109,12 @@ class Video(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # 地址人工复核确认标记，见location_review_items表和
+    # add_location_review_schema.sql：confirmed之后这条视频的地址
+    # 才算人工背书过，不会再被后续复核流程重复捞出来
+    location_confirmed: Mapped[bool] = mapped_column(Boolean, default=False)
+    location_confirmed_by: Mapped[int | None] = mapped_column(ForeignKey("operators.id"))
+    location_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     pipeline_status: Mapped[list["VideoPipelineStatus"]] = relationship(
         back_populates="video"
@@ -130,6 +137,12 @@ class Location(Base):
     site: Mapped[str] = mapped_column(Text)
     threshold_meters: Mapped[float]
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    location_group_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("location_groups.id")
+    )
+    # 这个location目前用哪张截图代表它，供以后的视频跟它做视觉比对；
+    # 刚建的新location一开始是空的，见Task5里"确认时反向回填"的逻辑
+    representative_frame_path: Mapped[str | None] = mapped_column(Text)
 
 
 class PipelineStage(Base):
@@ -280,3 +293,64 @@ class PipelineArtifact(Base):
     metadata_: Mapped[dict] = mapped_column("metadata", JSONB, default=dict)
     operator_name: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class LocationGroup(Base):
+    """人工把多个locations合并确认为"同一个物理地址"后的分组。见
+    add_location_review_schema.sql。"""
+
+    __tablename__ = "location_groups"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    name: Mapped[str] = mapped_column(Text)
+    confirmed_by: Mapped[int | None] = mapped_column(ForeignKey("operators.id"))
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class OperatorApiToken(Base):
+    __tablename__ = "operator_api_tokens"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    operator_id: Mapped[int] = mapped_column(ForeignKey("operators.id"))
+    token_hash: Mapped[str] = mapped_column(Text, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class LocationReviewItem(Base):
+    """地址人工复核+视觉校验流程里，每条待复核视频对应一行。human_decision/
+    status的取值在SQL层有CHECK约束，ORM层不重复声明。见
+    add_location_review_schema.sql。"""
+
+    __tablename__ = "location_review_items"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    video_sha256: Mapped[bytes] = mapped_column(
+        LargeBinary(32), ForeignKey("videos.sha256")
+    )
+    candidate_location_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("locations.id")
+    )
+    screenshot_path: Mapped[str | None] = mapped_column(Text)
+    visual_match_result: Mapped[dict | None] = mapped_column(JSONB)
+    llm_verdict: Mapped[dict | None] = mapped_column(JSONB)
+    llm_verdict_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    human_decision: Mapped[str | None] = mapped_column(Text)
+    decided_by: Mapped[int | None] = mapped_column(ForeignKey("operators.id"))
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(Text, default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class LocationChangeHistory(Base):
+    """地址/地址分组被人工复核改动时的审计记录，entity_type的取值在SQL层
+    有CHECK约束，ORM层不重复声明。见 add_location_review_schema.sql。"""
+
+    __tablename__ = "location_change_history"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    entity_type: Mapped[str] = mapped_column(Text)
+    entity_id: Mapped[int] = mapped_column(BigInteger)
+    field_name: Mapped[str] = mapped_column(Text)
+    old_value: Mapped[str | None] = mapped_column(Text)
+    new_value: Mapped[str | None] = mapped_column(Text)
+    changed_by: Mapped[int | None] = mapped_column(ForeignKey("operators.id"))
+    changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    reason: Mapped[str | None] = mapped_column(Text)
