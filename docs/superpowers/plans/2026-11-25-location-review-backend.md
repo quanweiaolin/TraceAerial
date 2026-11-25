@@ -514,14 +514,37 @@ GET  /location-review/agreement-rate                  LLM一致率统计
 逻辑：按`video.city`（视频自己的`city`字段，为空直接422"该视频没有
 city信息，无法生成候选"）查`locations`表里同城市、
 `representative_frame_path IS NOT NULL`的全部行作为候选集；用Task3的
-`extract_frame`对`video_path`提取一次截图（只提一次，不要每个候选都
-重新提取）；候选集非空时，对每个候选调一次
-`location_review.create_review_item(session, video_sha256,
-candidate.id, video_path, candidate.representative_frame_path)`；候选集
-为空时（这个城市还没有任何一个location有参考截图——常见于新城市第一条
-数据），调一次`create_review_item(session, video_sha256, None,
-video_path, None)`，让人工直接判定"这是个新地点"。返回新建的全部
-`LocationReviewItem`列表。
+`extract_frame`对`video_path`提取一次截图到一个临时文件
+（`tempfile.mkstemp(suffix=".jpg")`），得到`extracted_frame_path`
+（只提一次，不要每个候选都重新提取；`extract_frame`抛`ValueError`时
+捕获，把`extracted_frame_path`当成空字符串`""`继续走下面的流程，不让
+整个请求500——见Review Focus里"截图失败"那条）；候选集非空时，对每个
+候选调一次`location_review.create_review_item(session, video_sha256,
+candidate.id, extracted_frame_path, candidate.representative_frame_path)`
+（**注意传的是`extracted_frame_path`这个截图路径，不是`video_path`
+原始视频路径**——`create_review_item`的签名要的是已提取好的截图）；
+候选集为空时（这个城市还没有任何一个location有参考截图——常见于新城市
+第一条数据），调一次`create_review_item(session, video_sha256, None,
+extracted_frame_path, None)`，让人工直接判定"这是个新地点"。
+
+**LLM影子判断接入**（2026-11-25补——Task6的`judge_async`写完后一直没有
+任何代码调用它，这里是唯一合适的接入点）：每条成功建出来的
+`LocationReviewItem`（`status != "screenshot_failed"`且
+`candidate_frame_path`不为空，也就是真的有两张图可比的那些；
+"新地点"候选`candidate_location_id=None`的那条没有候选截图，跳过LLM
+判断），额外调一次`location_llm_judge.judge_async(item,
+extracted_frame_path, candidate.representative_frame_path)`；返回结果
+的`same_location`字段不是`None`（也就是判断真的成功了，不是
+Task6-review里标出来的"调用失败"兜底dict）时，才把整个judge结果写入
+`item.llm_verdict`（`jsonb`）+`item.llm_verdict_at=now()`；
+`same_location is None`（判断失败）时，**不写**`llm_verdict`，保持
+`NULL`（落实Task6审核时parked的那条建议：失败的判断不能跟真实的
+"不同意"混在一起，否则会永久拖累`compute_agreement_rate`的一致率）。
+这一步失败（网络错误等——虽然`judge_async`自己不会抛异常，但防御性地
+整个包一层`try/except`）也不能挡住`create_review_item`本身的成功，LLM
+判断失败只是`llm_verdict`留空，这条review item本身照常建出来返回。
+
+返回新建的全部`LocationReviewItem`列表。
 
 - [ ] **Step 2: 在`main.py`挂router**：`from app.api.routers import
   ..., location_review` + `app.include_router(location_review.router)`
