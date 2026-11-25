@@ -18,7 +18,13 @@ from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
 
-from app.api.routers import aliyun_status, aliyun_urgent_download, pipeline_artifacts, videos
+from app.api.routers import (
+    aliyun_status,
+    aliyun_urgent_download,
+    location_review,
+    pipeline_artifacts,
+    videos,
+)
 from app.config import settings
 from app.db import SessionContext
 from app.services import feishu_bot
@@ -111,6 +117,7 @@ app.include_router(videos.router)
 app.include_router(aliyun_status.router)
 app.include_router(aliyun_urgent_download.router)
 app.include_router(pipeline_artifacts.router)
+app.include_router(location_review.router)
 
 
 @app.post("/scan/trigger")
