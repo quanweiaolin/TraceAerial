@@ -12,7 +12,7 @@ def record_change(
     session: AsyncSession,
     *,
     entity_type: str,
-    entity_id: int,
+    entity_id: str,
     field_name: str,
     old_value: str | None,
     new_value: str | None,

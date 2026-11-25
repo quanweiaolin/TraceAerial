@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS location_review_items (
 CREATE TABLE IF NOT EXISTS location_change_history (
     id          bigserial PRIMARY KEY,
     entity_type text NOT NULL CHECK (entity_type IN ('video', 'location', 'location_group')),
-    entity_id   bigint NOT NULL,
+    entity_id   text NOT NULL,
     field_name  text NOT NULL,
     old_value   text,
     new_value   text,

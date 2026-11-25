@@ -23,19 +23,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Location, LocationGroup, LocationReviewItem, Video
+from app.services.hashing import sha256_bytes_to_hex
 from app.services.location_history import record_change
 from app.services.location_visual_match import compare_frames
-
-
-def _video_entity_id(video_sha256: bytes) -> int:
-    """LocationChangeHistory.entity_id是bigint NOT NULL，但Video的主键
-    是32字节的sha256(bytea)，不是整数——这里取sha256的前8字节转成有符号
-    int64，作为entity_type="video"这条审计记录的entity_id取值。这只是
-    审计表"entity_id必须是整数"这个约束下的妥协表示，不是真的查询键；
-    真正定位视频永远用video_sha256这个值本身，不依赖这个派生整数。brief
-    没有覆盖这个schema缺口(entity_id类型和videos表主键类型不一致)，这是
-    实现时做的判断，已在报告里标注。"""
-    return int.from_bytes(video_sha256[:8], "big", signed=True)
 
 
 async def create_review_item(
@@ -146,7 +136,7 @@ async def apply_human_decision(
             record_change(
                 session,
                 entity_type="video",
-                entity_id=_video_entity_id(video.sha256),
+                entity_id=sha256_bytes_to_hex(video.sha256),
                 field_name="location_id",
                 old_value=str(old_location_id) if old_location_id is not None else None,
                 new_value=str(target_location_id),
@@ -158,7 +148,7 @@ async def apply_human_decision(
     record_change(
         session,
         entity_type="video",
-        entity_id=_video_entity_id(video.sha256),
+        entity_id=sha256_bytes_to_hex(video.sha256),
         field_name="location_confirmed",
         old_value=str(video.location_confirmed),
         new_value=str(True),
@@ -180,7 +170,7 @@ async def apply_human_decision(
             record_change(
                 session,
                 entity_type="location",
-                entity_id=target_location.id,
+                entity_id=str(target_location.id),
                 field_name="representative_frame_path",
                 old_value=None,
                 new_value=item.screenshot_path,
@@ -229,7 +219,7 @@ async def merge_location_groups(
         record_change(
             session,
             entity_type="location",
-            entity_id=loc.id,
+            entity_id=str(loc.id),
             field_name="location_group_id",
             old_value=None,
             new_value=str(group.id),

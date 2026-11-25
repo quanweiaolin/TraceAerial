@@ -347,7 +347,7 @@ class LocationChangeHistory(Base):
     __tablename__ = "location_change_history"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     entity_type: Mapped[str] = mapped_column(Text)
-    entity_id: Mapped[int] = mapped_column(BigInteger)
+    entity_id: Mapped[str] = mapped_column(Text)
     field_name: Mapped[str] = mapped_column(Text)
     old_value: Mapped[str | None] = mapped_column(Text)
     new_value: Mapped[str | None] = mapped_column(Text)
