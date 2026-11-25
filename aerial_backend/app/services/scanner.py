@@ -129,6 +129,8 @@ async def _assign_city_site(
     聚类，video.location_id保持NULL；地址一旦分配不会再改(调用方保证
     video是刚入库、location_id还是空的新记录，不会对已有地址的视频重新
     判定)。"""
+    if video.location_confirmed:
+        return
     if video.collect_lon is None or video.collect_lat is None:
         return
     if video.is_stable is False:
