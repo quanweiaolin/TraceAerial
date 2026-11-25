@@ -69,6 +69,14 @@ class Settings(BaseSettings):
     # 飞手手动飞去了别的地方，这条视频的单点GPS/地址可能不准
     flight_stability_max_drift_meters: float = 30.0
 
+    # 地址人工复核：视频截图/候选地址参考截图落地的持久目录(不能用/tmp，
+    # 这条路径要长期存进location_review_items.screenshot_path/
+    # locations.representative_frame_path，/tmp上的文件可能被系统清理
+    # 导致路径悬空——2026-11-25复核发现)。留空时退回仓库里的
+    # location_review_frames/子目录(相对路径，跟aliyun_download_dir的
+    # 默认值"data"同样的风格，生产环境建议在.env里配成真实的持久路径)
+    location_review_frames_dir: str = ""
+
     # LLM agent(飞书问答机器人，app/llm_agent/)：这3个走标准ANTHROPIC_*
     # 变量名(不带AERIAL_前缀)，因为换Provider/配置时希望跟标准Anthropic
     # SDK文档/生态的叫法保持一致，不要求用户额外记一套改了名字的变量。
