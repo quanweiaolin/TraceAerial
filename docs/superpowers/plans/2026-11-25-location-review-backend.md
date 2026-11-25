@@ -50,9 +50,12 @@ OpenCV），截图提取用`ffmpeg`子进程（跟现有`video_metadata.py`调
   显式拒绝（提示"已锁定，需要先解锁"），不能静默覆盖人工已确认的结果。
 - token被撤销（`revoked_at`非空）后仍然用它请求——必须401，不能因为
   token在表里查得到就当作有效。
-- 视频对应的本地文件无法提取出有效帧（文件损坏/路径不存在）——创建
-  复核候选时不能因为截图失败而整体报错崩溃，应该把该候选标记为
-  "截图失败"状态，视觉比对结果留空，照样允许人工凭其他佐证做决策。
+- 视频对应的本地文件无法提取出有效帧（文件损坏/路径不存在）——`POST
+  /location-review/queue/generate`（Task7）调`extract_frame`失败时
+  不能让整个请求500，要捕获异常、改成调
+  `create_review_item(..., video_frame_path="", ...)`（空路径，Task5里
+  `create_review_item`据此判定`status="screenshot_failed"`），视觉比对
+  结果留空，照样允许人工凭其他佐证做决策。
 - LLM影子判断调用失败（网络/API错误/模型拒绝）——不能影响复核候选的
   创建和人工决策流程，`llm_verdict`留空、记一条日志即可，人工决策不
   依赖LLM结果。
@@ -114,6 +117,9 @@ OpenCV），截图提取用`ffmpeg`子进程（跟现有`video_metadata.py`调
   operators.id), `changed_at`, `reason`(可空)）、`OperatorApiToken`
   （`id`, `operator_id`FK, `token_hash`(unique), `created_at`,
   `revoked_at`可空）。`Location.location_group_id`（可空FK）、
+  `Location.representative_frame_path`（可空text——这个location目前
+  用哪张截图代表它，供以后的视频跟它做视觉比对；刚建的新location一开始
+  是空的，见Task5里"确认时反向回填"的逻辑）、
   `Video.location_confirmed`(bool,默认false)/`location_confirmed_by`
   (可空FK)/`location_confirmed_at`(可空)、`Operator.
   can_review_location`(bool,默认false)。
@@ -134,7 +140,8 @@ CREATE TABLE IF NOT EXISTS location_groups (
 );
 
 ALTER TABLE locations
-    ADD COLUMN IF NOT EXISTS location_group_id bigint REFERENCES location_groups(id);
+    ADD COLUMN IF NOT EXISTS location_group_id bigint REFERENCES location_groups(id),
+    ADD COLUMN IF NOT EXISTS representative_frame_path text;
 
 ALTER TABLE videos
     ADD COLUMN IF NOT EXISTS location_confirmed boolean NOT NULL DEFAULT false,
@@ -341,23 +348,53 @@ git commit -m "feat: 地址变更历史记录 + 聚类跳过人工已锁定视�
 - Create: `aerial_backend/app/services/location_review.py`
 
 **Interfaces:**
-- Consumes：Task 1的四个新ORM类、Task 3的`compare_frames`/
-  `extract_frame`、Task 4的`record_change`
+- Consumes：Task 1的四个新ORM类、Task 3的`compare_frames`（注意：不是
+  `extract_frame`——截图提取由调用方做好、只传路径进来，见下）、Task 4的
+  `record_change`
 - Produces：
   - `create_review_item(session, video_sha256: bytes,
-    candidate_location_id: int | None, video_path: str,
+    candidate_location_id: int | None, video_frame_path: str,
     candidate_frame_path: str | None) -> LocationReviewItem`
-    （截图/比对失败时`status="screenshot_failed"`而不是抛异常，成功
-    则`status="pending"`）
+    （`video_frame_path`是**调用方已经提取好**的这条视频的截图本地路径
+    （不是原始视频路径）——同一条视频要跟多个候选location分别比对时，
+    只应该提取一次截图，重复提取是调用方的职责错误，不应该让
+    `create_review_item`每次都重新提取一遍；这个函数自己只负责把这张
+    已有截图存进`screenshot_path`、调用`compare_frames(video_frame_path,
+    candidate_frame_path)`（`candidate_frame_path`为`None`时跳过比对，
+    `visual_match_result`留空）。`compare_frames`异常/返回"无法估计"
+    不算失败，正常建item、`status="pending"`；只有`video_frame_path`
+    这个路径本身读不到（文件不存在/损坏，调用方提取截图这一步失败后
+    仍然调了这个函数）才是`status="screenshot_failed"`）
   - `apply_human_decision(session, item_id: int, decision: str,
     operator_id: int, *, target_location_id: int | None = None,
     reason: str | None = None) -> LocationReviewItem`（`decision`取值
-    同`human_decision`枚举；已经`location_confirmed=true`的视频直接
-    抛`ValueError("视频地址已锁定，需先解锁")`；成功后设置
-    `video.location_id`(若`decision != "different_location"`)、
-    `video.location_confirmed=True`、`location_confirmed_by`/
-    `_at`，并调`record_change`记两条历史：location_id变更+锁定状态
-    变更）
+    同`human_decision`枚举，三种取值的精确语义——2026-11-25预检时发现
+    原计划没写清楚，这里钉死，不要自己猜：
+      - `decision in ("same_location", "new_location")`：
+        `target_location_id`必填，否则抛`ValueError("缺少
+        target_location_id")`。两种取值在代码里走同一分支（唯一区别
+        只是"这个地点是不是复核候选本身"，对数据库写入没有区别）。
+      - `decision == "different_location"`：`target_location_id`必须
+        是`None`，否则抛`ValueError("different_location不应该带
+        target_location_id")`；`video.location_id`保持原值不变（可能
+        还是NULL，也可能是别的待定值，这个决策只是否定了"是这个候选"，
+        不代表已经确定是别的某个地点）。
+      已经`location_confirmed=true`的视频直接抛
+      `ValueError("视频地址已锁定，需先解锁")`。
+      成功后：`same_location`/`new_location`两种情况下设置
+      `video.location_id=target_location_id`；三种情况下都设置
+      `video.location_confirmed=True`、`location_confirmed_by`/`_at`；
+      调`record_change`记录涉及字段的变更（`location_id`变了才记一条，
+      `location_confirmed`总是要记一条）。
+      **反向回填截图**（新增，解决"候选location的参考截图从哪来"这个
+      缺口——否则以后新location永远没有`representative_frame_path`，
+      没法再跟后续视频比对）：当`decision`是`same_location`或
+      `new_location`且`target_location_id`对应的`Location.
+      representative_frame_path`当前为空时，用这个item的
+      `screenshot_path`（这条视频自己的截图）去回填那个
+      `Location.representative_frame_path`，同样调`record_change`记
+      一条（`entity_type="location"`）。`screenshot_path`本身为空
+      （比如这条item是`screenshot_failed`状态）时跳过回填，不报错。）
   - `merge_location_groups(session, location_ids: list[int],
     group_name: str, operator_id: int) -> LocationGroup`（任一
     `location_id`已属于别的`location_group_id`则抛
@@ -444,13 +481,15 @@ git commit -m "feat: LLM地址判断影子模式 + 人工一致率统计"
 - Modify: `aerial_backend/app/main.py`
 
 **Interfaces:**
-- Consumes：Task 2的`require_location_reviewer`，Task 5/6的所有函数
+- Consumes：Task 2的`require_location_reviewer`，Task 3的
+  `extract_frame`，Task 5/6的所有函数
 
 - [ ] **Step 1: 实现路由**（全部`Depends(require_location_reviewer)`）
 
 ```
 GET  /location-review/queue?status=pending          列表
 GET  /location-review/queue/{item_id}                详情
+POST /location-review/queue/generate                  生成复核候选(见下)
 POST /location-review/queue/{item_id}/decide         人工决策
 POST /location-review/groups/merge                    合并location_group
 GET  /location-review/agreement-rate                  LLM一致率统计
@@ -461,6 +500,28 @@ GET  /location-review/agreement-rate                  LLM一致率统计
 捕获`apply_human_decision`/`merge_location_groups`抛出的`ValueError`
 转成`HTTPException(409, str(exc))`（409不是400——这是状态冲突，不是
 输入格式错误）。
+
+**`POST /location-review/queue/generate`**（2026-11-25预检新增——原计划
+一直没有任何代码会往`location_review_items`里写数据，Task5的
+`create_review_item`只是"给一个候选就建一条"，缺一个"给一个视频找出
+候选"的入口，否则复核队列永远是空的，Task7剩下那几个接口无从测起）：
+
+请求体：`video_sha256: str`(hex字符串，用现有
+`app.services.hashing.sha256_hex_to_bytes`转bytes)，`video_path: str`
+（本地文件路径，调用方传进来，不在这一步反查`videos.storage_path`——
+跟其它接口一样让调用方负责给出路径）。
+
+逻辑：按`video.city`（视频自己的`city`字段，为空直接422"该视频没有
+city信息，无法生成候选"）查`locations`表里同城市、
+`representative_frame_path IS NOT NULL`的全部行作为候选集；用Task3的
+`extract_frame`对`video_path`提取一次截图（只提一次，不要每个候选都
+重新提取）；候选集非空时，对每个候选调一次
+`location_review.create_review_item(session, video_sha256,
+candidate.id, video_path, candidate.representative_frame_path)`；候选集
+为空时（这个城市还没有任何一个location有参考截图——常见于新城市第一条
+数据），调一次`create_review_item(session, video_sha256, None,
+video_path, None)`，让人工直接判定"这是个新地点"。返回新建的全部
+`LocationReviewItem`列表。
 
 - [ ] **Step 2: 在`main.py`挂router**：`from app.api.routers import
   ..., location_review` + `app.include_router(location_review.router)`
