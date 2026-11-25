@@ -195,11 +195,20 @@ def _diagnose_small_cluster(
 async def main(database_url: str, apply: bool, threshold_meters: float, max_drift_meters: float) -> None:
     conn = await asyncpg.connect(database_url, server_settings={"search_path": "aerial,public"})
     try:
+        # 2026-11-25加 AND location_confirmed = false(Finding I1)：一条视频
+        # 哪怕location_id还是NULL，只要已经被人工复核锁定(location_confirmed
+        # =true，比如human_decision="different_location"但还没决出最终归属)，
+        # 这个批量聚类脚本也绝不能碰它——人工锁定高于任何自动化重跑，不管
+        # 当前location_id具体是什么值。
         rows_raw = await conn.fetch(
             "SELECT sha256, storage_path, collect_lon, collect_lat, srt_height, is_stable FROM videos "
-            "WHERE deleted_at IS NULL AND location_id IS NULL ORDER BY sha256"
+            "WHERE deleted_at IS NULL AND location_id IS NULL AND location_confirmed = false "
+            "ORDER BY sha256"
         )
-        print(f"待检查: {len(rows_raw)} 条(deleted_at IS NULL且location_id IS NULL的活记录)")
+        print(
+            f"待检查: {len(rows_raw)} 条(deleted_at IS NULL且location_id IS NULL"
+            f"且location_confirmed=false的活记录)"
+        )
 
         matched = 0
         no_gps = 0
@@ -307,8 +316,15 @@ async def main(database_url: str, apply: bool, threshold_meters: float, max_drif
                     location_ids[(city, site)] = row["id"]
                 for sha256, city, site, flight_height in video_updates:
                     location_id = location_ids.get((city, site)) if site is not None else None
+                    # 防御性再加一层location_confirmed = false(Finding I1)：
+                    # 虽然video_updates里的记录全部来自上面已经按
+                    # location_confirmed=false过滤过的rows_raw，但如果两次
+                    # 查询之间这条视频被别的请求(人工复核API)刚好锁定，这条
+                    # WHERE条件能保证即使撞上这个时间窗也不会覆盖人工锁定的
+                    # 视频。
                     await conn.execute(
-                        "UPDATE videos SET city = $2, location_id = $3, flight_height = $4 WHERE sha256 = $1",
+                        "UPDATE videos SET city = $2, location_id = $3, flight_height = $4 "
+                        "WHERE sha256 = $1 AND location_confirmed = false",
                         sha256, city, location_id, flight_height,
                     )
             print("已写入数据库(--apply)")
