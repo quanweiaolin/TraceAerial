@@ -17,8 +17,12 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-import cv2
-import numpy as np
+# cv2/numpy只在compare_frames内部用到，故意不放在模块顶层导入(Finding
+# I4)：extract_frame这条路径是纯ffmpeg子进程，不依赖OpenCV，如果
+# opencv-python-headless还没装进某个环境，之前的模块级import会让整个
+# 模块(进而app.main整条router链)import失败，连不需要视觉比对的功能也
+# 跟着挂掉；移到函数体内后，缺cv2只会让compare_frames这一个函数在被
+# 真正调用时才报ImportError，不影响别的功能。
 
 # RANSAC求单应矩阵的重投影误差阈值(像素)：误差超过这个值的匹配点对不计入内点。
 _RANSAC_REPROJ_THRESHOLD = 4.0
@@ -91,6 +95,9 @@ def compare_frames(frame_a_path: str, frame_b_path: str) -> dict:
     描述性的失败结果，不向上抛异常——这只是人工复核流程的辅助参考，不能
     让内部异常打断整个复核请求。
     """
+    import cv2
+    import numpy as np
+
     img_a = cv2.imread(frame_a_path, cv2.IMREAD_GRAYSCALE)
     img_b = cv2.imread(frame_b_path, cv2.IMREAD_GRAYSCALE)
     if img_a is None or img_b is None:
