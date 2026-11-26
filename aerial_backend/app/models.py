@@ -311,6 +311,10 @@ class LocationGroup(Base):
     confirmed_by: Mapped[int | None] = mapped_column(ForeignKey("operators.id"))
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # 2026-11-26加：客户对这个地点各自的命名/编号，比如{"zyt_name": "ADS3-1"}。
+    # 扁平字典，key不固定、不做枚举校验——新客户出现时前端直接多一个key，
+    # 不需要改schema。没有别名的分组继续用name展示，这里只是附加信息。
+    aliases: Mapped[dict] = mapped_column(JSONB, default=dict)
 
 
 class OperatorApiToken(Base):

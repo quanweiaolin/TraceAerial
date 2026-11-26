@@ -32,6 +32,7 @@ from app.services import location_llm_judge, location_review
 from app.services.geo import distance_3d_meters
 from app.services.hashing import sha256_bytes_to_hex, sha256_hex_to_bytes
 from app.services.location_auth import require_location_reviewer
+from app.services.location_history import record_change
 from app.services.location_visual_match import extract_frame
 
 router = APIRouter(prefix="/location-review", tags=["location_review"])
@@ -428,9 +429,45 @@ async def list_groups(
                     {"id": member.id, "city": member.city, "site": member.site}
                     for member in members
                 ],
+                "aliases": group.aliases,
             }
         )
     return result
+
+
+class UpdateGroupAliasIn(BaseModel):
+    key: str
+    value: str | None = None
+
+
+@router.patch("/groups/{group_id}/aliases")
+async def update_group_alias(
+    group_id: int,
+    body: UpdateGroupAliasIn,
+    session: AsyncSession = Depends(get_session),
+    operator: Operator = Depends(require_location_reviewer),
+):
+    """新增/修改/删除一个客户别名(`value`为`None`代表删除)。整字典替换
+    赋值(`group.aliases = new_aliases`)而不是原地`.pop()`/`[key]=...`——
+    SQLAlchemy对JSONB列的变更追踪靠赋值触发脏标记，原地改字典ORM感知
+    不到，不会真的写进数据库。"""
+    group = await session.get(LocationGroup, group_id)
+    if group is None:
+        raise HTTPException(404, "分组不存在")
+    old_value = group.aliases.get(body.key)
+    new_aliases = dict(group.aliases)
+    if body.value is None:
+        new_aliases.pop(body.key, None)
+    else:
+        new_aliases[body.key] = body.value
+    record_change(
+        session, entity_type="location_group", entity_id=str(group_id),
+        field_name=f"alias:{body.key}", old_value=old_value, new_value=body.value,
+        changed_by=operator.id,
+    )
+    group.aliases = new_aliases
+    await session.commit()
+    return {"id": group.id, "aliases": group.aliases}
 
 
 @router.get("/folder-audit")

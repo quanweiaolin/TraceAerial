@@ -71,3 +71,6 @@ CREATE INDEX IF NOT EXISTS idx_location_change_history_entity
 
 ALTER TABLE locations
     ADD COLUMN IF NOT EXISTS representative_video_sha256 bytea REFERENCES videos(sha256);
+
+ALTER TABLE location_groups
+    ADD COLUMN IF NOT EXISTS aliases jsonb NOT NULL DEFAULT '{}';
