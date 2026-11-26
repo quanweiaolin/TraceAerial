@@ -84,6 +84,9 @@ export interface GroupSummary {
   name: string;
   confirmed_at: string;
   members: GroupMember[];
+  // 客户对这个地点各自的命名/编号，比如{zyt_name: "ADS3-1"}。没有别名的
+  // 分组是空对象，展示时继续用name，不强制要求有别名。
+  aliases: Record<string, string>;
 }
 
 // 后端 GET /location-review/agreement-rate 的返回形状——LLM判断与人工复核决策的

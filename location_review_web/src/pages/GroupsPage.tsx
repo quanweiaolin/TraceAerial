@@ -3,6 +3,8 @@ import { apiFetch, ApiError } from "../api/client";
 import { useApiQuery } from "../api/useApiQuery";
 import type { GroupSummary, LocationSummary } from "../api/types";
 
+const NEW_ALIAS_KEY_OPTION = "__new__";
+
 export function GroupsPage() {
   const {
     data: groupsData,
@@ -24,6 +26,47 @@ export function GroupsPage() {
   const [groupName, setGroupName] = useState("");
   const [mergeError, setMergeError] = useState<string | null>(null);
   const [merging, setMerging] = useState(false);
+
+  // 别名编辑草稿，按group.id分开存——每个分组有自己独立的下拉选择/
+  // 新key输入/值输入状态，互不干扰
+  const [aliasKeySelect, setAliasKeySelect] = useState<Record<number, string>>({});
+  const [aliasCustomKey, setAliasCustomKey] = useState<Record<number, string>>({});
+  const [aliasValue, setAliasValue] = useState<Record<number, string>>({});
+  const [aliasSaving, setAliasSaving] = useState<Record<number, boolean>>({});
+  const [aliasError, setAliasError] = useState<Record<number, string | null>>({});
+
+  // 候选key从已经拉取的全部分组里去重算出来，不需要单独的接口/枚举表——
+  // 新客户出现过一次之后，下拉框自然就多一个选项
+  const knownAliasKeys = Array.from(new Set(groups.flatMap((g) => Object.keys(g.aliases))));
+
+  async function handleSaveAlias(groupId: number) {
+    const selected = aliasKeySelect[groupId] ?? "";
+    const key =
+      selected === NEW_ALIAS_KEY_OPTION
+        ? (aliasCustomKey[groupId] ?? "").trim()
+        : selected.trim();
+    if (key === "") return;
+    setAliasSaving((prev) => ({ ...prev, [groupId]: true }));
+    setAliasError((prev) => ({ ...prev, [groupId]: null }));
+    try {
+      const rawValue = (aliasValue[groupId] ?? "").trim();
+      await apiFetch(`/location-review/groups/${groupId}/aliases`, {
+        method: "PATCH",
+        body: JSON.stringify({ key, value: rawValue === "" ? null : rawValue }),
+      });
+      setAliasKeySelect((prev) => ({ ...prev, [groupId]: "" }));
+      setAliasCustomKey((prev) => ({ ...prev, [groupId]: "" }));
+      setAliasValue((prev) => ({ ...prev, [groupId]: "" }));
+      refetchGroups();
+    } catch (err) {
+      setAliasError((prev) => ({
+        ...prev,
+        [groupId]: err instanceof ApiError ? err.message : err instanceof Error ? err.message : "保存失败",
+      }));
+    } finally {
+      setAliasSaving((prev) => ({ ...prev, [groupId]: false }));
+    }
+  }
 
   function toggleSelected(id: number) {
     setSelectedIds((prev) =>
@@ -71,18 +114,92 @@ export function GroupsPage() {
         {!groupsLoading && !groupsError && groups.length === 0 && <p>还没有任何分组</p>}
         {!groupsLoading && !groupsError && groups.length > 0 && (
           <ul>
-            {groups.map((group) => (
-              <li key={group.id} data-testid={`group-${group.id}`}>
-                <strong>{group.name}</strong>
-                <ul>
-                  {group.members.map((member) => (
-                    <li key={member.id}>
-                      {member.city} / <span>{member.site}</span>
-                    </li>
-                  ))}
-                </ul>
-              </li>
-            ))}
+            {groups.map((group) => {
+              const selected = aliasKeySelect[group.id] ?? "";
+              const resolvedKey =
+                selected === NEW_ALIAS_KEY_OPTION
+                  ? (aliasCustomKey[group.id] ?? "").trim()
+                  : selected.trim();
+              const canSubmitAlias = resolvedKey !== "";
+              return (
+                <li key={group.id} data-testid={`group-${group.id}`}>
+                  <strong>{group.name}</strong>
+                  <ul>
+                    {group.members.map((member) => (
+                      <li key={member.id}>
+                        {member.city} / <span>{member.site}</span>
+                      </li>
+                    ))}
+                  </ul>
+
+                  <div>
+                    <h3>别名</h3>
+                    {Object.keys(group.aliases).length === 0 ? (
+                      <p>暂无别名</p>
+                    ) : (
+                      <ul>
+                        {Object.entries(group.aliases).map(([key, value]) => (
+                          <li key={key}>
+                            {key}: {value}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+
+                    <label htmlFor={`alias-key-select-${group.id}`}>别名key：</label>
+                    <select
+                      id={`alias-key-select-${group.id}`}
+                      value={selected}
+                      onChange={(event) =>
+                        setAliasKeySelect((prev) => ({ ...prev, [group.id]: event.target.value }))
+                      }
+                    >
+                      <option value="">请选择</option>
+                      {knownAliasKeys.map((key) => (
+                        <option key={key} value={key}>
+                          {key}
+                        </option>
+                      ))}
+                      <option value={NEW_ALIAS_KEY_OPTION}>新增...</option>
+                    </select>
+
+                    {selected === NEW_ALIAS_KEY_OPTION && (
+                      <>
+                        <label htmlFor={`alias-new-key-${group.id}`}>新key：</label>
+                        <input
+                          id={`alias-new-key-${group.id}`}
+                          type="text"
+                          value={aliasCustomKey[group.id] ?? ""}
+                          onChange={(event) =>
+                            setAliasCustomKey((prev) => ({ ...prev, [group.id]: event.target.value }))
+                          }
+                        />
+                      </>
+                    )}
+
+                    <label htmlFor={`alias-value-${group.id}`}>别名值：</label>
+                    <input
+                      id={`alias-value-${group.id}`}
+                      type="text"
+                      value={aliasValue[group.id] ?? ""}
+                      onChange={(event) =>
+                        setAliasValue((prev) => ({ ...prev, [group.id]: event.target.value }))
+                      }
+                    />
+
+                    <button
+                      type="button"
+                      onClick={() => handleSaveAlias(group.id)}
+                      disabled={!canSubmitAlias || !!aliasSaving[group.id]}
+                    >
+                      保存别名
+                    </button>
+
+                    {aliasError[group.id] && <p role="alert">{aliasError[group.id]}</p>}
+                  </div>
+                </li>
+              );
+            })}
           </ul>
         )}
       </section>
