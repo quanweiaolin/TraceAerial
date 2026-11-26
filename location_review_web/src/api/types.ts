@@ -58,3 +58,14 @@ export interface FolderAuditVideo {
   collect_lon: number | null;
   collect_lat: number | null;
 }
+
+// 后端 GET /location-review/locations 的返回形状——locations表全量列表，
+// 跟ReviewCandidate形状相似但不是同一个东西(多了location_group_id，少了
+// group_name)，所以单独建一个类型而不是复用ReviewCandidate。
+export interface LocationSummary {
+  id: number;
+  city: string;
+  site: string;
+  representative_frame_path: string | null;
+  location_group_id: number | null;
+}

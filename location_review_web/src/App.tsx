@@ -1,6 +1,7 @@
 import { Navigate, Route, Routes } from "react-router-dom";
 import { AppShell } from "./components/AppShell";
 import { FolderAuditPage } from "./pages/FolderAuditPage";
+import { LocationsPage } from "./pages/LocationsPage";
 import { LoginPage } from "./pages/LoginPage";
 import { QueuePage } from "./pages/QueuePage";
 import { ReviewDetailPage } from "./pages/ReviewDetailPage";
@@ -14,6 +15,7 @@ function App() {
         <Route path="queue" element={<QueuePage />} />
         <Route path="queue/:itemId" element={<ReviewDetailPage />} />
         <Route path="folder-audit" element={<FolderAuditPage />} />
+        <Route path="locations" element={<LocationsPage />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
