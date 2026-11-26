@@ -39,20 +39,13 @@ export function GroupsPage() {
   // 新客户出现过一次之后，下拉框自然就多一个选项
   const knownAliasKeys = Array.from(new Set(groups.flatMap((g) => Object.keys(g.aliases))));
 
-  async function handleSaveAlias(groupId: number) {
-    const selected = aliasKeySelect[groupId] ?? "";
-    const key =
-      selected === NEW_ALIAS_KEY_OPTION
-        ? (aliasCustomKey[groupId] ?? "").trim()
-        : selected.trim();
-    if (key === "") return;
+  async function submitAliasPatch(groupId: number, key: string, value: string | null) {
     setAliasSaving((prev) => ({ ...prev, [groupId]: true }));
     setAliasError((prev) => ({ ...prev, [groupId]: null }));
     try {
-      const rawValue = (aliasValue[groupId] ?? "").trim();
       await apiFetch(`/location-review/groups/${groupId}/aliases`, {
         method: "PATCH",
-        body: JSON.stringify({ key, value: rawValue === "" ? null : rawValue }),
+        body: JSON.stringify({ key, value }),
       });
       setAliasKeySelect((prev) => ({ ...prev, [groupId]: "" }));
       setAliasCustomKey((prev) => ({ ...prev, [groupId]: "" }));
@@ -66,6 +59,24 @@ export function GroupsPage() {
     } finally {
       setAliasSaving((prev) => ({ ...prev, [groupId]: false }));
     }
+  }
+
+  function handleSaveAlias(groupId: number) {
+    const selected = aliasKeySelect[groupId] ?? "";
+    const key =
+      selected === NEW_ALIAS_KEY_OPTION
+        ? (aliasCustomKey[groupId] ?? "").trim()
+        : selected.trim();
+    // 2026-11-26最终review Important#1：值留空直接保存等于悄悄删掉这个
+    // 别名——key和值都必须非空才允许保存，真的要删除走下面独立的
+    // handleDeleteAlias，不能靠"清空再保存"这种容易误触的隐式路径。
+    const value = (aliasValue[groupId] ?? "").trim();
+    if (key === "" || value === "") return;
+    void submitAliasPatch(groupId, key, value);
+  }
+
+  function handleDeleteAlias(groupId: number, key: string) {
+    void submitAliasPatch(groupId, key, null);
   }
 
   function toggleSelected(id: number) {
@@ -120,7 +131,8 @@ export function GroupsPage() {
                 selected === NEW_ALIAS_KEY_OPTION
                   ? (aliasCustomKey[group.id] ?? "").trim()
                   : selected.trim();
-              const canSubmitAlias = resolvedKey !== "";
+              const resolvedValue = (aliasValue[group.id] ?? "").trim();
+              const canSubmitAlias = resolvedKey !== "" && resolvedValue !== "";
               return (
                 <li key={group.id} data-testid={`group-${group.id}`}>
                   <strong>{group.name}</strong>
@@ -140,7 +152,14 @@ export function GroupsPage() {
                       <ul>
                         {Object.entries(group.aliases).map(([key, value]) => (
                           <li key={key}>
-                            {key}: {value}
+                            {key}: {value}{" "}
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteAlias(group.id, key)}
+                              disabled={!!aliasSaving[group.id]}
+                            >
+                              删除 {key}
+                            </button>
                           </li>
                         ))}
                       </ul>

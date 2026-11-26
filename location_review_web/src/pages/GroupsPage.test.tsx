@@ -144,6 +144,19 @@ test("展示已有别名，支持新增别名", async () => {
   server.use(
     http.patch("*/location-review/groups/1/aliases", async ({ request }) => {
       capturedBody = await request.json();
+      // 2026-11-26最终review指出：原测试只断言请求体，从没验证保存成功后
+      // 列表真的刷新、表单真的清空——这正是生产代码里唯一需要"人工走查
+      // 才能确认正确"的部分。这里改成跟"选中地点后点击合并按钮"那个测试
+      // 同样的模式：handler里真的更新currentGroups，再断言UI反映出新值。
+      currentGroups = [
+        {
+          id: 1,
+          name: "盘石路片区",
+          confirmed_at: "2026-11-20T00:00:00Z",
+          members: [],
+          aliases: { zyt_name: "ADS3-1", new_customer: "X-1" },
+        },
+      ];
       return HttpResponse.json({
         id: 1,
         aliases: { zyt_name: "ADS3-1", new_customer: "X-1" },
@@ -171,6 +184,13 @@ test("展示已有别名，支持新增别名", async () => {
   await waitFor(() => {
     expect(capturedBody).toEqual({ key: "new_customer", value: "X-1" });
   });
+
+  // 保存成功后：新别名真的出现在列表里，而不是只发了请求没刷新
+  expect(await screen.findByText("new_customer: X-1")).toBeInTheDocument();
+  // 表单重置了：下拉框回到未选状态，值输入框清空——否则在同一个分组上
+  // 接着加第二条别名会沿用上一条的残留输入
+  expect(screen.getByLabelText("别名值：")).toHaveValue("");
+  expect(screen.queryByLabelText("新key：")).not.toBeInTheDocument();
 });
 
 test("新key为空时保存按钮保持禁用", async () => {
@@ -200,6 +220,84 @@ test("新key为空时保存按钮保持禁用", async () => {
   await user.type(screen.getByLabelText("别名值："), "X-1");
 
   expect(screen.getByRole("button", { name: "保存别名" })).toBeDisabled();
+});
+
+test("别名值为空时保存按钮保持禁用——防止误触空值把已有别名删掉", async () => {
+  // 2026-11-26最终review Important#1：原来只要求key非空，值留空直接点
+  // 保存会发一个value:null的请求，等于悄悄把已有别名删了，且没有任何
+  // 确认——这里要求key和值都非空才能点保存。
+  currentGroups = [
+    {
+      id: 1,
+      name: "盘石路片区",
+      confirmed_at: "2026-11-20T00:00:00Z",
+      members: [],
+      aliases: { zyt_name: "ADS3-1" },
+    },
+  ];
+  server.use(
+    http.patch("*/location-review/groups/1/aliases", () => {
+      throw new Error("不应该发起这个请求");
+    }),
+  );
+
+  render(
+    <MemoryRouter>
+      <GroupsPage />
+    </MemoryRouter>,
+  );
+
+  const user = userEvent.setup();
+  await user.selectOptions(await screen.findByLabelText("别名key："), "zyt_name");
+  // 值输入框留空，不输入任何内容
+
+  expect(screen.getByRole("button", { name: "保存别名" })).toBeDisabled();
+});
+
+test("点击删除按钮可以删除已有别名", async () => {
+  // 2026-11-26最终review Important#1：删除别名要有一个显式的、独立于
+  // "保存"按钮的入口，不能靠"把值清空再保存"这种容易误触的隐式路径。
+  currentGroups = [
+    {
+      id: 1,
+      name: "盘石路片区",
+      confirmed_at: "2026-11-20T00:00:00Z",
+      members: [],
+      aliases: { zyt_name: "ADS3-1" },
+    },
+  ];
+  let capturedBody: unknown = null;
+  server.use(
+    http.patch("*/location-review/groups/1/aliases", async ({ request }) => {
+      capturedBody = await request.json();
+      currentGroups = [
+        {
+          id: 1,
+          name: "盘石路片区",
+          confirmed_at: "2026-11-20T00:00:00Z",
+          members: [],
+          aliases: {},
+        },
+      ];
+      return HttpResponse.json({ id: 1, aliases: {} });
+    }),
+  );
+
+  render(
+    <MemoryRouter>
+      <GroupsPage />
+    </MemoryRouter>,
+  );
+
+  expect(await screen.findByText("zyt_name: ADS3-1")).toBeInTheDocument();
+
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "删除 zyt_name" }));
+
+  await waitFor(() => {
+    expect(capturedBody).toEqual({ key: "zyt_name", value: null });
+  });
+  expect(await screen.findByText("暂无别名")).toBeInTheDocument();
 });
 
 test("没有别名时显示空态", async () => {
