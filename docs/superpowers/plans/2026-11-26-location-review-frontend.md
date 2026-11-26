@@ -197,7 +197,7 @@ git commit -m "feat: 地点/分组列表接口+文件夹审查接口+CORS"
   - `apiFetch<T>(path: string, options?: RequestInit) -> Promise<T>`（`client.ts`，自动加`Authorization: Bearer <token>`头，收到401时清空token+跳转`/login`，其它非2xx抛出带状态码的Error）
   - `AuthProvider`/`useAuth() -> {token: string | null, login: (token: string) => void, logout: () => void}`（`AuthContext.tsx`，token读写`localStorage`）
   - `AppShell`：侧边栏5个nav项（队列/文件夹审查/地点/分组/一致率看板）+ `<Outlet />`路由出口
-  - `types.ts`里的`ReviewItem`类型要跟Task2新增的字段对齐：`screenshot_paths: string[]`、`candidate: {id:number; city:string; site:string; representative_frame_path:string|null; group_name:string|null} | null`、`gps_distance_meters: number | null`、`video_filename: string`、`video_city: string | null`、`video_collected_at: string | null`，以及原有的`visual_match_result`/`llm_verdict`/`human_decision`/`status`等字段
+  - `types.ts`里的`ReviewItem`类型要跟Task2新增的字段对齐：`screenshot_paths: string[]`、`candidate: {id:number; city:string; site:string; representative_frame_path:string|null; group_name:string|null} | null`、`gps_distance_meters: number | null`、`video_filename: string`、`video_city: string | null`、`video_collected_at: string | null`、`video_location_confirmed: boolean`，以及原有的`visual_match_result`/`llm_verdict`/`human_decision`/`status`等字段
 
 - [ ] **Step 1: `vite create`脚手架**（`npm create vite@latest location_review_web -- --template react-ts`，之后装`react-router-dom`、`vitest`、`@testing-library/react`、`msw`）
 
@@ -244,6 +244,7 @@ git commit -m "feat: 前端脚手架+token鉴权+整体布局"
 **Files:**
 - Create: `location_review_web/src/pages/QueuePage.tsx`
 - Test: `location_review_web/src/pages/QueuePage.test.tsx`
+- Modify: `location_review_web/src/App.tsx`（在`AppShell`的`<Outlet />`路由表里加`/`（默认首页）和`/queue`两条路由指向`QueuePage`）
 
 **Interfaces:**
 - Consumes：Task4的`apiFetch`/`ReviewItem`类型
@@ -275,7 +276,7 @@ Run: `cd location_review_web && npx vitest run src/pages/QueuePage.test.tsx`
 - [ ] **Step 5: Commit**
 
 ```bash
-git add location_review_web/src/pages/QueuePage.tsx location_review_web/src/pages/QueuePage.test.tsx
+git add location_review_web/src/pages/QueuePage.tsx location_review_web/src/pages/QueuePage.test.tsx location_review_web/src/App.tsx
 git commit -m "feat: 复核队列列表页"
 ```
 
@@ -287,6 +288,7 @@ git commit -m "feat: 复核队列列表页"
 - Create: `location_review_web/src/pages/ReviewDetailPage.tsx`
 - Create: `location_review_web/src/components/ImageGallery.tsx`
 - Create: `location_review_web/src/components/MetricsPanel.tsx`
+- Modify: `location_review_web/src/App.tsx`（加`/queue/:itemId`路由指向`ReviewDetailPage`）
 - Test: `location_review_web/src/components/MetricsPanel.test.tsx`
 - Test: `location_review_web/src/pages/ReviewDetailPage.test.tsx`
 
@@ -316,7 +318,7 @@ git commit -m "feat: 复核队列列表页"
 - [ ] **Step 9: Commit**
 
 ```bash
-git add location_review_web/src/pages/ReviewDetailPage.tsx location_review_web/src/components/ImageGallery.tsx location_review_web/src/components/MetricsPanel.tsx location_review_web/src/*.test.tsx
+git add location_review_web/src/pages/ReviewDetailPage.tsx location_review_web/src/components/ImageGallery.tsx location_review_web/src/components/MetricsPanel.tsx location_review_web/src/*.test.tsx location_review_web/src/App.tsx
 git commit -m "feat: 复核详情页(核心对比+决策+解锁)"
 ```
 
@@ -327,6 +329,7 @@ git commit -m "feat: 复核详情页(核心对比+决策+解锁)"
 **Files:**
 - Create: `location_review_web/src/pages/FolderAuditPage.tsx`
 - Test: `location_review_web/src/pages/FolderAuditPage.test.tsx`
+- Modify: `location_review_web/src/App.tsx`（加`/folder-audit`路由）
 
 **Interfaces:**
 - Consumes：后端`GET /location-review/folder-audit?storage_path_prefix=...`、`POST /location-review/queue/generate`
@@ -343,7 +346,7 @@ git commit -m "feat: 复核详情页(核心对比+决策+解锁)"
 - [ ] **Step 5: Commit**
 
 ```bash
-git add location_review_web/src/pages/FolderAuditPage.tsx location_review_web/src/pages/FolderAuditPage.test.tsx
+git add location_review_web/src/pages/FolderAuditPage.tsx location_review_web/src/pages/FolderAuditPage.test.tsx location_review_web/src/App.tsx
 git commit -m "feat: 文件夹审查页"
 ```
 
@@ -354,6 +357,7 @@ git commit -m "feat: 文件夹审查页"
 **Files:**
 - Create: `location_review_web/src/pages/LocationsPage.tsx`
 - Test: `location_review_web/src/pages/LocationsPage.test.tsx`
+- Modify: `location_review_web/src/App.tsx`（加`/locations`路由）
 
 **Interfaces:**
 - Consumes：后端`GET /location-review/locations`、`POST /location-review/locations`
@@ -363,7 +367,7 @@ git commit -m "feat: 文件夹审查页"
 - [ ] **Step 5: Commit**
 
 ```bash
-git add location_review_web/src/pages/LocationsPage.tsx location_review_web/src/pages/LocationsPage.test.tsx
+git add location_review_web/src/pages/LocationsPage.tsx location_review_web/src/pages/LocationsPage.test.tsx location_review_web/src/App.tsx
 git commit -m "feat: 地点管理页"
 ```
 
@@ -374,6 +378,7 @@ git commit -m "feat: 地点管理页"
 **Files:**
 - Create: `location_review_web/src/pages/GroupsPage.tsx`
 - Test: `location_review_web/src/pages/GroupsPage.test.tsx`
+- Modify: `location_review_web/src/App.tsx`（加`/groups`路由）
 
 **Interfaces:**
 - Consumes：后端`GET /location-review/groups`、`POST /location-review/groups/merge`
@@ -383,7 +388,7 @@ git commit -m "feat: 地点管理页"
 - [ ] **Step 5: Commit**
 
 ```bash
-git add location_review_web/src/pages/GroupsPage.tsx location_review_web/src/pages/GroupsPage.test.tsx
+git add location_review_web/src/pages/GroupsPage.tsx location_review_web/src/pages/GroupsPage.test.tsx location_review_web/src/App.tsx
 git commit -m "feat: 分组管理页"
 ```
 
@@ -394,6 +399,7 @@ git commit -m "feat: 分组管理页"
 **Files:**
 - Create: `location_review_web/src/pages/AgreementRatePage.tsx`
 - Test: `location_review_web/src/pages/AgreementRatePage.test.tsx`
+- Modify: `location_review_web/src/App.tsx`（加`/agreement-rate`路由）
 
 **Interfaces:**
 - Consumes：后端`GET /location-review/agreement-rate`
@@ -403,7 +409,7 @@ git commit -m "feat: 分组管理页"
 - [ ] **Step 5: Commit**
 
 ```bash
-git add location_review_web/src/pages/AgreementRatePage.tsx location_review_web/src/pages/AgreementRatePage.test.tsx
+git add location_review_web/src/pages/AgreementRatePage.tsx location_review_web/src/pages/AgreementRatePage.test.tsx location_review_web/src/App.tsx
 git commit -m "feat: 一致率看板页"
 ```
 
