@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -363,6 +364,26 @@ async def agreement_rate(
     )
 
 
+@router.get("/frame")
+async def get_frame(
+    path: str,
+    operator: Operator = Depends(require_location_reviewer),
+):
+    """把截图文件的字节传给前端——screenshot_paths/representative_frame_path
+    存的是服务器本地文件系统路径，浏览器没法直接访问，也没法在<img src>上带
+    Authorization头，所以前端要先authed fetch这个接口拿字节，再用
+    URL.createObjectURL展示(见location_review_web/src/api/client.ts的
+    apiFetchBlob)。只允许访问location_review_frames_dir目录下的文件，
+    防止用这个接口当成任意文件读取的后门。"""
+    frames_dir = Path(settings.location_review_frames_dir or "location_review_frames").resolve()
+    requested = Path(path).resolve()
+    if not requested.is_relative_to(frames_dir):
+        raise HTTPException(404, "文件不存在")
+    if not requested.is_file():
+        raise HTTPException(404, "文件不存在")
+    return FileResponse(requested)
+
+
 @router.get("/locations")
 async def list_locations(
     session: AsyncSession = Depends(get_session),
@@ -420,9 +441,13 @@ async def folder_audit(
 ):
     """按`storage_path`前缀批量审查一批视频的落库情况，供人工核对某个
     采集文件夹整体对应到的地址/锁定状态。`.like()`用参数绑定而不是
-    自己拼SQL字符串——`storage_path_prefix`是未受信任的查询参数。"""
+    自己拼SQL字符串——`storage_path_prefix`是未受信任的查询参数。
+
+    加`.limit(500)`防止一个过于宽泛(比如空字符串/过短)的前缀匹配出整张
+    videos表、拖垮数据库——前端据此判断"结果可能被截断"，提示用户输入
+    更精确的前缀，而不是后端再加一个专门的截断标记字段(Finding I5)。"""
     videos_result = await session.execute(
-        select(Video).where(Video.storage_path.like(f"{storage_path_prefix}%"))
+        select(Video).where(Video.storage_path.like(f"{storage_path_prefix}%")).limit(500)
     )
     videos = videos_result.scalars().all()
     return [
