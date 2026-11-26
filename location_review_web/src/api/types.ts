@@ -1,10 +1,27 @@
-export type VisualMatchResult = "match" | "mismatch" | "uncertain" | null;
+// 后端 app/services/location_visual_match.py 里 compare_frames() 的真实
+// 返回形状——不是一个枚举字符串，是SIFT+RANSAC比对的具体数值结果。
+export interface VisualMatchResult {
+  matched: boolean;
+  inliers: number;
+  inlier_ratio: number;
+  auto_accepted: boolean;
+  auto_reason: string;
+}
 
-export type LlmVerdict = "match" | "mismatch" | "uncertain" | null;
+// 后端 app/services/location_llm_judge.py 里 judge_async() 的真实返回形状。
+// same_location为null代表LLM调用失败(见后端"失败不计入一致率"的设计)，
+// 不是"判断为不是同一地点"。
+export interface LlmVerdict {
+  same_location: boolean | null;
+  confidence: number;
+  reasoning: string;
+}
 
-export type HumanDecision = "confirm" | "reject" | "pending" | null;
+// 跟SQL的CHECK约束(add_location_review_schema.sql的human_decision列)
+// 完全对应的三个取值，见后端location_review.py的apply_human_decision。
+export type HumanDecision = "same_location" | "different_location" | "new_location" | null;
 
-export type ReviewStatus = "pending" | "confirmed" | "rejected" | string;
+export type ReviewStatus = "pending" | "decided" | "screenshot_failed" | string;
 
 export interface ReviewCandidate {
   id: number;
@@ -17,6 +34,8 @@ export interface ReviewCandidate {
 export interface ReviewItem {
   id: number;
   status: ReviewStatus;
+  video_sha256: string;
+  candidate_location_id: number | null;
   screenshot_paths: string[];
   candidate: ReviewCandidate | null;
   gps_distance_meters: number | null;
@@ -24,7 +43,7 @@ export interface ReviewItem {
   video_city: string | null;
   video_collected_at: string | null;
   video_location_confirmed: boolean;
-  visual_match_result: VisualMatchResult;
-  llm_verdict: LlmVerdict;
+  visual_match_result: VisualMatchResult | null;
+  llm_verdict: LlmVerdict | null;
   human_decision: HumanDecision;
 }
