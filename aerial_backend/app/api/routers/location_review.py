@@ -26,8 +26,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db import get_session
-from app.models import Location, LocationReviewItem, Operator, Video
+from app.models import Location, LocationGroup, LocationReviewItem, Operator, Video
 from app.services import location_llm_judge, location_review
+from app.services.geo import distance_3d_meters
 from app.services.hashing import sha256_bytes_to_hex, sha256_hex_to_bytes
 from app.services.location_auth import require_location_reviewer
 from app.services.location_visual_match import extract_frame
@@ -35,16 +36,69 @@ from app.services.location_visual_match import extract_frame
 router = APIRouter(prefix="/location-review", tags=["location_review"])
 
 
-def _serialize_review_item(item: LocationReviewItem) -> dict:
+def _resolve_height(video: Video) -> float | None:
+    """每条视频各自独立判断：`srt_height`不为空用`srt_height`，否则退回
+    `flight_height`；两者都为空时返回`None`(由调用方决定GPS距离算不出来
+    的后续处理，不在这里报错)。"""
+    return video.srt_height if video.srt_height is not None else video.flight_height
+
+
+async def _serialize_review_item(session: AsyncSession, item: LocationReviewItem) -> dict:
     """手建dict返回，不直接把ORM对象交给FastAPI——`video_sha256`是bytea，
     `jsonable_encoder`会尝试把它当UTF-8字符串`.decode()`，对真实sha256
     摘要几乎总是报`UnicodeDecodeError`(见app/api/routers/videos.py同样的
-    手建dict+hex编码惯例)。"""
+    手建dict+hex编码惯例)。
+
+    额外给前端拼上GPS距离/候选地点身份/视频识别信息，省得前端自己再发
+    请求查这些(见Task2 brief)。"""
+    video = await session.get(Video, item.video_sha256)
+    video_filename = Path(video.storage_path).name if video is not None else None
+
+    candidate: dict | None = None
+    candidate_location: Location | None = None
+    if item.candidate_location_id is not None:
+        candidate_location = await session.get(Location, item.candidate_location_id)
+        if candidate_location is not None:
+            group_name = None
+            if candidate_location.location_group_id is not None:
+                group = await session.get(LocationGroup, candidate_location.location_group_id)
+                group_name = group.name if group is not None else None
+            candidate = {
+                "id": candidate_location.id,
+                "city": candidate_location.city,
+                "site": candidate_location.site,
+                "representative_frame_path": candidate_location.representative_frame_path,
+                "group_name": group_name,
+            }
+
+    gps_distance_meters: float | None = None
+    if (
+        video is not None
+        and candidate_location is not None
+        and candidate_location.representative_video_sha256 is not None
+    ):
+        ref_video = await session.get(Video, candidate_location.representative_video_sha256)
+        if ref_video is not None:
+            if (
+                video.collect_lon is not None
+                and video.collect_lat is not None
+                and ref_video.collect_lon is not None
+                and ref_video.collect_lat is not None
+            ):
+                video_height = _resolve_height(video)
+                ref_height = _resolve_height(ref_video)
+                if video_height is not None and ref_height is not None:
+                    gps_distance_meters = distance_3d_meters(
+                        video.collect_lon, video.collect_lat, video_height,
+                        ref_video.collect_lon, ref_video.collect_lat, ref_height,
+                    )
+
     return {
         "id": item.id,
         "video_sha256": sha256_bytes_to_hex(item.video_sha256),
         "candidate_location_id": item.candidate_location_id,
         "screenshot_path": item.screenshot_path,
+        "screenshot_paths": [item.screenshot_path] if item.screenshot_path is not None else [],
         "visual_match_result": item.visual_match_result,
         "llm_verdict": item.llm_verdict,
         "llm_verdict_at": item.llm_verdict_at,
@@ -53,6 +107,12 @@ def _serialize_review_item(item: LocationReviewItem) -> dict:
         "decided_at": item.decided_at,
         "status": item.status,
         "created_at": item.created_at,
+        "candidate": candidate,
+        "gps_distance_meters": gps_distance_meters,
+        "video_filename": video_filename,
+        "video_city": video.city if video is not None else None,
+        "video_collected_at": video.collected_at if video is not None else None,
+        "video_location_confirmed": video.location_confirmed if video is not None else False,
     }
 
 
@@ -68,7 +128,7 @@ async def list_queue(
     if status is not None:
         stmt = stmt.where(LocationReviewItem.status == status)
     items = (await session.execute(stmt)).scalars().all()
-    return [_serialize_review_item(item) for item in items]
+    return [await _serialize_review_item(session, item) for item in items]
 
 
 @router.get("/queue/{item_id}")
@@ -80,7 +140,7 @@ async def get_queue_item(
     item = await session.get(LocationReviewItem, item_id)
     if item is None:
         raise HTTPException(404, "复核item不存在")
-    return _serialize_review_item(item)
+    return await _serialize_review_item(session, item)
 
 
 class GenerateQueueIn(BaseModel):
@@ -198,7 +258,7 @@ async def generate_queue(
             )
             created_items.append(item)
 
-    return [_serialize_review_item(item) for item in created_items]
+    return [await _serialize_review_item(session, item) for item in created_items]
 
 
 class DecideIn(BaseModel):
@@ -225,7 +285,7 @@ async def decide_queue_item(
         )
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
-    return _serialize_review_item(item)
+    return await _serialize_review_item(session, item)
 
 
 class UnlockVideoIn(BaseModel):
