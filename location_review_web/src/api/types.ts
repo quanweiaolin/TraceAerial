@@ -85,3 +85,12 @@ export interface GroupSummary {
   confirmed_at: string;
   members: GroupMember[];
 }
+
+// 后端 GET /location-review/agreement-rate 的返回形状——LLM判断与人工复核决策的
+// 一致率统计，ready_for_automation为false代表一致率还未达到切换为LLM自动判断的阈值。
+export interface AgreementRate {
+  total: number;
+  agreed: number;
+  disagreed: number;
+  ready_for_automation: boolean;
+}

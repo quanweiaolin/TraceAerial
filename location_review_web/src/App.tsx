@@ -1,5 +1,6 @@
 import { Navigate, Route, Routes } from "react-router-dom";
 import { AppShell } from "./components/AppShell";
+import { AgreementRatePage } from "./pages/AgreementRatePage";
 import { FolderAuditPage } from "./pages/FolderAuditPage";
 import { GroupsPage } from "./pages/GroupsPage";
 import { LocationsPage } from "./pages/LocationsPage";
@@ -18,6 +19,7 @@ function App() {
         <Route path="folder-audit" element={<FolderAuditPage />} />
         <Route path="locations" element={<LocationsPage />} />
         <Route path="groups" element={<GroupsPage />} />
+        <Route path="agreement-rate" element={<AgreementRatePage />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
