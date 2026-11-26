@@ -9,6 +9,8 @@ import type { ReviewItem } from "../api/types";
 const baseItem: ReviewItem = {
   id: 1,
   status: "pending",
+  video_sha256: "a".repeat(64),
+  candidate_location_id: null,
   screenshot_paths: [],
   candidate: null,
   gps_distance_meters: null,
@@ -19,7 +21,7 @@ const baseItem: ReviewItem = {
   visual_match_result: null,
   llm_verdict: null,
   human_decision: null,
-} as unknown as ReviewItem;
+};
 
 const server = setupServer(
   http.get("*/location-review/queue", () =>
