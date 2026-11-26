@@ -361,3 +361,78 @@ async def agreement_rate(
     return await location_llm_judge.compute_agreement_rate(
         session, exclude_corrected=exclude_corrected
     )
+
+
+@router.get("/locations")
+async def list_locations(
+    session: AsyncSession = Depends(get_session),
+    operator: Operator = Depends(require_location_reviewer),
+):
+    """全量返回locations表(不分页——当前量级42条，忽略分页)，供前端做
+    地址候选下拉/人工复核时的参照列表。"""
+    locations = (await session.execute(select(Location))).scalars().all()
+    return [
+        {
+            "id": location.id,
+            "city": location.city,
+            "site": location.site,
+            "representative_frame_path": location.representative_frame_path,
+            "location_group_id": location.location_group_id,
+        }
+        for location in locations
+    ]
+
+
+@router.get("/groups")
+async def list_groups(
+    session: AsyncSession = Depends(get_session),
+    operator: Operator = Depends(require_location_reviewer),
+):
+    """列出全部LocationGroup，每个group内联查一下它的members(location_
+    group_id==group.id的Location集合)——group数量就个位数/十位数级别，
+    这里的N+1不值得优化成一次join。"""
+    groups = (await session.execute(select(LocationGroup))).scalars().all()
+    result = []
+    for group in groups:
+        members_result = await session.execute(
+            select(Location).where(Location.location_group_id == group.id)
+        )
+        members = members_result.scalars().all()
+        result.append(
+            {
+                "id": group.id,
+                "name": group.name,
+                "confirmed_at": group.confirmed_at,
+                "members": [
+                    {"id": member.id, "city": member.city, "site": member.site}
+                    for member in members
+                ],
+            }
+        )
+    return result
+
+
+@router.get("/folder-audit")
+async def folder_audit(
+    storage_path_prefix: str,
+    session: AsyncSession = Depends(get_session),
+    operator: Operator = Depends(require_location_reviewer),
+):
+    """按`storage_path`前缀批量审查一批视频的落库情况，供人工核对某个
+    采集文件夹整体对应到的地址/锁定状态。`.like()`用参数绑定而不是
+    自己拼SQL字符串——`storage_path_prefix`是未受信任的查询参数。"""
+    videos_result = await session.execute(
+        select(Video).where(Video.storage_path.like(f"{storage_path_prefix}%"))
+    )
+    videos = videos_result.scalars().all()
+    return [
+        {
+            "video_sha256": sha256_bytes_to_hex(video.sha256),
+            "storage_path": video.storage_path,
+            "location_id": video.location_id,
+            "is_stable": video.is_stable,
+            "collect_lon": video.collect_lon,
+            "collect_lat": video.collect_lat,
+        }
+        for video in videos
+    ]

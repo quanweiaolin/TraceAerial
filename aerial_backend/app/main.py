@@ -17,6 +17,7 @@ from datetime import datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routers import (
     aliyun_status,
@@ -113,6 +114,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Aerial Video Data Management", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+)
 app.include_router(videos.router)
 app.include_router(aliyun_status.router)
 app.include_router(aliyun_urgent_download.router)
