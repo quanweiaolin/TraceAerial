@@ -47,3 +47,14 @@ export interface ReviewItem {
   llm_verdict: LlmVerdict | null;
   human_decision: HumanDecision;
 }
+
+// 后端 GET /location-review/folder-audit 的返回形状——按storage_path前缀列出
+// 该目录下的视频，location_id为null代表这条视频还没被任何地点收录。
+export interface FolderAuditVideo {
+  video_sha256: string;
+  storage_path: string;
+  location_id: number | null;
+  is_stable: boolean | null;
+  collect_lon: number | null;
+  collect_lat: number | null;
+}
