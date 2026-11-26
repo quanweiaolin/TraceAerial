@@ -1,30 +1,37 @@
 import { useState } from "react";
 import { apiFetch, ApiError } from "../api/client";
+import { useApiQuery } from "../api/useApiQuery";
 import type { FolderAuditVideo } from "../api/types";
+
+// 后端folder_audit接口加了.limit(500)防止空/过短前缀拖垮查询——命中这个
+// 上限时前端提示"结果可能被截断"，不需要后端额外返回一个截断标记字段，
+// 直接比较返回条数就行(Finding I5)。
+const RESULT_LIMIT = 500;
 
 export function FolderAuditPage() {
   const [prefix, setPrefix] = useState("");
-  const [videos, setVideos] = useState<FolderAuditVideo[] | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [queryPath, setQueryPath] = useState<string | null>(null);
   const [generateError, setGenerateError] = useState<string | null>(null);
   const [generatedShas, setGeneratedShas] = useState<Set<string>>(new Set());
 
-  async function handleSubmit(event: React.FormEvent) {
+  const { data: videos, loading, error, refetch } = useApiQuery<FolderAuditVideo[]>(queryPath);
+
+  const trimmedPrefix = prefix.trim();
+  const canSubmit = trimmedPrefix !== "";
+
+  function handleSubmit(event: React.FormEvent) {
     event.preventDefault();
-    setLoading(true);
-    setError(null);
+    if (!canSubmit) {
+      return;
+    }
     setGenerateError(null);
-    try {
-      const data = await apiFetch<FolderAuditVideo[]>(
-        `/location-review/folder-audit?storage_path_prefix=${encodeURIComponent(prefix)}`,
-      );
-      setVideos(data);
-    } catch (err) {
-      setVideos(null);
-      setError(err instanceof Error ? err.message : "加载失败");
-    } finally {
-      setLoading(false);
+    const nextPath = `/location-review/folder-audit?storage_path_prefix=${encodeURIComponent(trimmedPrefix)}`;
+    if (nextPath === queryPath) {
+      // 前缀跟上次查询完全一样——path不变不会触发hook重新请求，得显式
+      // 调refetch()才能真的重新发一次查询(比如想看看是不是有新视频入库)。
+      refetch();
+    } else {
+      setQueryPath(nextPath);
     }
   }
 
@@ -59,7 +66,7 @@ export function FolderAuditPage() {
           value={prefix}
           onChange={(event) => setPrefix(event.target.value)}
         />
-        <button type="submit" disabled={loading}>
+        <button type="submit" disabled={!canSubmit || loading}>
           查询
         </button>
       </form>
@@ -68,11 +75,15 @@ export function FolderAuditPage() {
       {error && <p role="alert">{error}</p>}
       {generateError && <p role="alert">{generateError}</p>}
 
-      {!loading && !error && videos !== null && videos.length === 0 && (
+      {!loading && !error && videos !== null && videos !== undefined && videos.length === 0 && (
         <p>这个前缀下没有视频</p>
       )}
 
-      {!loading && !error && videos !== null && videos.length > 0 && (
+      {!loading && !error && videos && videos.length >= RESULT_LIMIT && (
+        <p role="alert">结果可能被截断，请输入更精确的路径前缀</p>
+      )}
+
+      {!loading && !error && videos && videos.length > 0 && (
         <table>
           <thead>
             <tr>

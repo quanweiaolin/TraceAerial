@@ -1,28 +1,10 @@
-import { useEffect, useState } from "react";
-import { apiFetch } from "../api/client";
+import { useApiQuery } from "../api/useApiQuery";
 import type { AgreementRate } from "../api/types";
 
 export function AgreementRatePage() {
-  const [rate, setRate] = useState<AgreementRate | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  async function loadRate() {
-    setLoading(true);
-    setError(null);
-    try {
-      const data = await apiFetch<AgreementRate>("/location-review/agreement-rate");
-      setRate(data);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "加载失败");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    loadRate();
-  }, []);
+  const { data: rate, loading, error } = useApiQuery<AgreementRate>(
+    "/location-review/agreement-rate",
+  );
 
   return (
     <div>

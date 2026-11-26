@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { apiFetch } from "../api/client";
+import { useApiQuery } from "../api/useApiQuery";
 import type { ReviewItem, ReviewStatus } from "../api/types";
 
 const PAGE_SIZE = 20;
@@ -18,37 +18,14 @@ function isSuperseded(item: ReviewItem): boolean {
 
 export function QueuePage() {
   const navigate = useNavigate();
-  const [items, setItems] = useState<ReviewItem[]>([]);
   const [status, setStatus] = useState<string>("pending");
   const [page, setPage] = useState(1);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const query = status ? `?status=${status}` : "";
+  const { data, loading, error } = useApiQuery<ReviewItem[]>(`/location-review/queue${query}`);
+  const items = data ?? [];
 
   useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    setError(null);
-    const query = status ? `?status=${status}` : "";
-    apiFetch<ReviewItem[]>(`/location-review/queue${query}`)
-      .then((data) => {
-        if (!cancelled) {
-          setItems(data);
-          setPage(1);
-        }
-      })
-      .catch((err: unknown) => {
-        if (!cancelled) {
-          setError(err instanceof Error ? err.message : "加载失败");
-        }
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setLoading(false);
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
+    setPage(1);
   }, [status]);
 
   const totalPages = Math.max(1, Math.ceil(items.length / PAGE_SIZE));

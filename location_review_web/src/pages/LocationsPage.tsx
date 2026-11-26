@@ -1,56 +1,29 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { apiFetch, ApiError } from "../api/client";
+import { useApiQuery } from "../api/useApiQuery";
 import type { LocationSummary } from "../api/types";
 
 export function LocationsPage() {
-  const [locations, setLocations] = useState<LocationSummary[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const { data, loading, error, refetch } = useApiQuery<LocationSummary[]>(
+    "/location-review/locations",
+  );
+  const locations = data ?? [];
 
   const [city, setCity] = useState("");
   const [sitePrefix, setSitePrefix] = useState("");
   const [createError, setCreateError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
 
-  async function loadLocations() {
-    setLoading(true);
-    setError(null);
-    try {
-      const data = await apiFetch<LocationSummary[]>("/location-review/locations");
-      setLocations(data);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "加载失败");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    loadLocations();
-  }, []);
-
   async function handleCreate(event: React.FormEvent) {
     event.preventDefault();
     setCreating(true);
     setCreateError(null);
     try {
-      const created = await apiFetch<{ id: number; city: string; site: string }>(
-        "/location-review/locations",
-        {
-          method: "POST",
-          body: JSON.stringify({ city, site_prefix: sitePrefix }),
-        },
-      );
-      setLocations((prev) => [
-        ...prev,
-        {
-          id: created.id,
-          city: created.city,
-          site: created.site,
-          representative_frame_path: null,
-          location_group_id: null,
-        },
-      ]);
+      await apiFetch<{ id: number; city: string; site: string }>("/location-review/locations", {
+        method: "POST",
+        body: JSON.stringify({ city, site_prefix: sitePrefix }),
+      });
+      refetch();
       setCity("");
       setSitePrefix("");
     } catch (err) {

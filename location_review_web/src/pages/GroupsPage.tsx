@@ -1,51 +1,29 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { apiFetch, ApiError } from "../api/client";
+import { useApiQuery } from "../api/useApiQuery";
 import type { GroupSummary, LocationSummary } from "../api/types";
 
 export function GroupsPage() {
-  const [groups, setGroups] = useState<GroupSummary[]>([]);
-  const [groupsLoading, setGroupsLoading] = useState(false);
-  const [groupsError, setGroupsError] = useState<string | null>(null);
+  const {
+    data: groupsData,
+    loading: groupsLoading,
+    error: groupsError,
+    refetch: refetchGroups,
+  } = useApiQuery<GroupSummary[]>("/location-review/groups");
+  const groups = groupsData ?? [];
 
-  const [locations, setLocations] = useState<LocationSummary[]>([]);
-  const [locationsLoading, setLocationsLoading] = useState(false);
-  const [locationsError, setLocationsError] = useState<string | null>(null);
+  const {
+    data: locationsData,
+    loading: locationsLoading,
+    error: locationsError,
+    refetch: refetchLocations,
+  } = useApiQuery<LocationSummary[]>("/location-review/locations");
+  const locations = locationsData ?? [];
 
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
   const [groupName, setGroupName] = useState("");
   const [mergeError, setMergeError] = useState<string | null>(null);
   const [merging, setMerging] = useState(false);
-
-  async function loadGroups() {
-    setGroupsLoading(true);
-    setGroupsError(null);
-    try {
-      const data = await apiFetch<GroupSummary[]>("/location-review/groups");
-      setGroups(data);
-    } catch (err) {
-      setGroupsError(err instanceof Error ? err.message : "加载失败");
-    } finally {
-      setGroupsLoading(false);
-    }
-  }
-
-  async function loadLocations() {
-    setLocationsLoading(true);
-    setLocationsError(null);
-    try {
-      const data = await apiFetch<LocationSummary[]>("/location-review/locations");
-      setLocations(data);
-    } catch (err) {
-      setLocationsError(err instanceof Error ? err.message : "加载失败");
-    } finally {
-      setLocationsLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    loadGroups();
-    loadLocations();
-  }, []);
 
   function toggleSelected(id: number) {
     setSelectedIds((prev) =>
@@ -67,8 +45,8 @@ export function GroupsPage() {
       );
       setSelectedIds([]);
       setGroupName("");
-      await loadGroups();
-      await loadLocations();
+      refetchGroups();
+      refetchLocations();
     } catch (err) {
       if (err instanceof ApiError) {
         setMergeError(err.message);
