@@ -68,3 +68,6 @@ CREATE INDEX IF NOT EXISTS idx_location_review_items_video_sha256
     ON location_review_items (video_sha256);
 CREATE INDEX IF NOT EXISTS idx_location_change_history_entity
     ON location_change_history (entity_type, entity_id, field_name);
+
+ALTER TABLE locations
+    ADD COLUMN IF NOT EXISTS representative_video_sha256 bytea REFERENCES videos(sha256);

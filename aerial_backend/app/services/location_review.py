@@ -200,6 +200,20 @@ async def apply_human_decision(
             )
             target_location.representative_frame_path = item.screenshot_path
 
+    if decision in ("same_location", "new_location"):
+        if target_location is not None and target_location.representative_video_sha256 is None:
+            record_change(
+                session,
+                entity_type="location",
+                entity_id=str(target_location.id),
+                field_name="representative_video_sha256",
+                old_value=None,
+                new_value=sha256_bytes_to_hex(video.sha256),
+                changed_by=operator_id,
+                reason=reason,
+            )
+            target_location.representative_video_sha256 = video.sha256
+
     await session.commit()
     return item
 

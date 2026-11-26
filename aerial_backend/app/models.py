@@ -143,6 +143,12 @@ class Location(Base):
     # 这个location目前用哪张截图代表它，供以后的视频跟它做视觉比对；
     # 刚建的新location一开始是空的，见Task5里"确认时反向回填"的逻辑
     representative_frame_path: Mapped[str | None] = mapped_column(Text)
+    # 这个location目前用哪条视频代表它，供以后视频级别的GPS/画面比对参考；
+    # 回填时机跟representative_frame_path一致，见location_review.py的
+    # apply_human_decision
+    representative_video_sha256: Mapped[bytes | None] = mapped_column(
+        LargeBinary(32), ForeignKey("videos.sha256")
+    )
 
 
 class PipelineStage(Base):
