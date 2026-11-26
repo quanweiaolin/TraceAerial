@@ -69,3 +69,19 @@ export interface LocationSummary {
   representative_frame_path: string | null;
   location_group_id: number | null;
 }
+
+// 后端 GET /location-review/groups 的返回形状——location_groups表全量列表，
+// members是已归入该组的locations精简信息(不是LocationSummary全量字段，
+// 后端只返回id/city/site)。
+export interface GroupMember {
+  id: number;
+  city: string;
+  site: string;
+}
+
+export interface GroupSummary {
+  id: number;
+  name: string;
+  confirmed_at: string;
+  members: GroupMember[];
+}
