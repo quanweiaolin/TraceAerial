@@ -18,14 +18,17 @@ location下随便挑一个视频抽帧，两两跑compare_frames，把SIFT+RANSA
 import argparse
 import asyncio
 import itertools
+import sys
 import tempfile
 from pathlib import Path
 
-from sqlalchemy import select
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.db import SessionContext
-from app.models import Location, Video
-from app.services.location_visual_match import compare_frames, extract_frame
+from sqlalchemy import select  # noqa: E402
+
+from app.db import SessionContext  # noqa: E402
+from app.models import Location, Video  # noqa: E402
+from app.services.location_visual_match import compare_frames, extract_frame  # noqa: E402
 
 
 async def pick_representative_video(session, location_id: int) -> Video | None:
