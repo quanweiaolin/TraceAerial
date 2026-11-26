@@ -63,3 +63,42 @@ export async function apiFetch<T>(
 
   return (await response.json()) as T;
 }
+
+export async function apiFetchBlob(path: string): Promise<string> {
+  // 返回一个blob: URL(object URL)，不是直接返回Blob——调用方(ImageGallery)
+  // 把这个URL直接赋给<img src>就行；用完之后调用方要自己URL.revokeObjectURL
+  // 释放，这个函数不负责生命周期管理
+  const token = localStorage.getItem(TOKEN_STORAGE_KEY);
+
+  const headers = new Headers();
+  if (token) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+
+  const response = await fetch(`${API_BASE_URL}${path}`, { headers });
+
+  if (response.status === 401) {
+    localStorage.removeItem(TOKEN_STORAGE_KEY);
+    if (typeof window !== "undefined") {
+      window.location.href = "/login";
+    }
+    throw new ApiError("未授权，请重新登录", 401);
+  }
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    let message = text;
+    try {
+      const parsed = JSON.parse(text) as { detail?: unknown };
+      if (typeof parsed.detail === "string" && parsed.detail) {
+        message = parsed.detail;
+      }
+    } catch {
+      // 不是JSON，用原始文本
+    }
+    throw new ApiError(message || `请求失败: ${response.status}`, response.status);
+  }
+
+  const blob = await response.blob();
+  return URL.createObjectURL(blob);
+}
