@@ -2,6 +2,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import { AppShell } from "./components/AppShell";
 import { LoginPage } from "./pages/LoginPage";
 import { QueuePage } from "./pages/QueuePage";
+import { ReviewDetailPage } from "./pages/ReviewDetailPage";
 
 function App() {
   return (
@@ -10,6 +11,7 @@ function App() {
       <Route path="/" element={<AppShell />}>
         <Route index element={<QueuePage />} />
         <Route path="queue" element={<QueuePage />} />
+        <Route path="queue/:itemId" element={<ReviewDetailPage />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
