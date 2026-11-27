@@ -18,16 +18,25 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db import get_session
-from app.models import Location, LocationGroup, LocationReviewItem, Operator, Video
+from app.models import (
+    Location,
+    LocationGroup,
+    LocationNamingAlert,
+    LocationReviewItem,
+    Operator,
+    Video,
+)
 from app.services import location_llm_judge, location_review
 from app.services.geo import distance_3d_meters
 from app.services.hashing import sha256_bytes_to_hex, sha256_hex_to_bytes
@@ -498,3 +507,165 @@ async def folder_audit(
         }
         for video in videos
     ]
+
+
+def _serialize_naming_alert(alert: LocationNamingAlert, locations_by_id: dict[int, Location]) -> dict:
+    """附上每个location_id当前的city/site，方便前端直接展示而不用再单独
+    查一次(Task3 brief要求批量补，见list_naming_alerts里一次性查完整批
+    Location再传进来，不在这里per-alert查询)。"""
+    return {
+        "id": alert.id,
+        "alert_type": alert.alert_type,
+        "city": alert.city,
+        "location_ids": alert.location_ids,
+        "raw_site_votes": alert.raw_site_votes,
+        "suggested_value": alert.suggested_value,
+        "status": alert.status,
+        "resolved_by": alert.resolved_by,
+        "resolved_at": alert.resolved_at,
+        "created_at": alert.created_at,
+        "locations": [
+            {
+                "id": location_id,
+                "city": locations_by_id[location_id].city,
+                "site": locations_by_id[location_id].site,
+            }
+            for location_id in alert.location_ids
+            if location_id in locations_by_id
+        ],
+    }
+
+
+@router.get("/naming-alerts")
+async def list_naming_alerts(
+    status: Literal["pending", "confirmed", "dismissed"] = "pending",
+    session: AsyncSession = Depends(get_session),
+    operator: Operator = Depends(require_location_reviewer),
+):
+    """列出命名审核告警(见app.services.location_naming_audit)，默认只看
+    pending的。为每个alert涉及的location_id附上当前的city/site——批量
+    查一次这批alert覆盖到的全部location_id，不对每条alert单独查
+    (避免N+1)。"""
+    alerts_result = await session.execute(
+        select(LocationNamingAlert)
+        .where(LocationNamingAlert.status == status)
+        .order_by(LocationNamingAlert.id.desc())
+    )
+    alerts = alerts_result.scalars().all()
+
+    all_location_ids: set[int] = set()
+    for alert in alerts:
+        all_location_ids.update(alert.location_ids)
+
+    locations_by_id: dict[int, Location] = {}
+    if all_location_ids:
+        locations_result = await session.execute(
+            select(Location).where(Location.id.in_(all_location_ids))
+        )
+        locations_by_id = {location.id: location for location in locations_result.scalars().all()}
+
+    return [_serialize_naming_alert(alert, locations_by_id) for alert in alerts]
+
+
+class ConfirmNamingAlertIn(BaseModel):
+    chosen_value: str | None = None
+
+
+async def _get_pending_naming_alert(session: AsyncSession, alert_id: int) -> LocationNamingAlert:
+    """404/409的公共校验逻辑：alert不存在报404，存在但已经不是pending(已经
+    被confirm或dismiss过)报409——不允许重复处理同一条alert(brief要求)。"""
+    alert = await session.get(LocationNamingAlert, alert_id)
+    if alert is None:
+        raise HTTPException(404, "提示不存在")
+    if alert.status != "pending":
+        raise HTTPException(409, "该提示已处理，不能重复操作")
+    return alert
+
+
+async def _serialize_naming_alert_with_locations(
+    session: AsyncSession, alert: LocationNamingAlert
+) -> dict:
+    """confirm/dismiss返回单条alert时复用跟列表接口一样的序列化形状——
+    重新查一次这条alert涉及的location(confirm的name_drift分支可能刚改过
+    其中一个的site，这里查到的是改写之后的最新值)。"""
+    locations_by_id: dict[int, Location] = {}
+    if alert.location_ids:
+        locations_result = await session.execute(
+            select(Location).where(Location.id.in_(alert.location_ids))
+        )
+        locations_by_id = {location.id: location for location in locations_result.scalars().all()}
+    return _serialize_naming_alert(alert, locations_by_id)
+
+
+@router.post("/naming-alerts/{alert_id}/confirm")
+async def confirm_naming_alert(
+    alert_id: int,
+    body: ConfirmNamingAlertIn,
+    session: AsyncSession = Depends(get_session),
+    operator: Operator = Depends(require_location_reviewer),
+):
+    """确认一条命名审核告警。
+
+    `alert_type=="name_drift"`：`chosen_value`必须非空(trim后)，把alert
+    唯一涉及的那个location(`location_ids[0]`，name_drift从构造时起就只有
+    一个location_id——见location_naming_audit.build_alert_candidates)的
+    `site`改写成`chosen_value`。这会跟其它location撞`UNIQUE(city, site)`
+    时，捕获写入阶段的`IntegrityError`，返回400而不是让它变成500。
+
+    `alert_type=="merge_candidate"`：这个endpoint不碰任何Location行——
+    真正的合并走现有的`/location-review/groups/merge`，这里只是把alert
+    本身标记为已确认，表示"人工已经看过这组投票分布并同意需要合并"。
+
+    两种情况成功后都设置`status="confirmed"`、`resolved_by`/`resolved_at`
+    并commit。"""
+    alert = await _get_pending_naming_alert(session, alert_id)
+
+    if alert.alert_type == "name_drift":
+        chosen_value = (body.chosen_value or "").strip()
+        if not chosen_value:
+            raise HTTPException(400, "chosen_value不能为空")
+
+        location_id = alert.location_ids[0]
+        location = await session.get(Location, location_id)
+        if location is None:
+            raise HTTPException(404, "该提示涉及的地址不存在")
+
+        old_site = location.site
+        location.site = chosen_value
+        record_change(
+            session, entity_type="location", entity_id=str(location_id),
+            field_name="site", old_value=old_site, new_value=chosen_value,
+            changed_by=operator.id,
+        )
+
+        alert.status = "confirmed"
+        alert.resolved_by = operator.id
+        alert.resolved_at = datetime.now(timezone.utc)
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            raise HTTPException(400, f"同城市下已经存在site=\"{chosen_value}\"的地址，不能重名") from None
+    else:
+        alert.status = "confirmed"
+        alert.resolved_by = operator.id
+        alert.resolved_at = datetime.now(timezone.utc)
+        await session.commit()
+
+    return await _serialize_naming_alert_with_locations(session, alert)
+
+
+@router.post("/naming-alerts/{alert_id}/dismiss")
+async def dismiss_naming_alert(
+    alert_id: int,
+    session: AsyncSession = Depends(get_session),
+    operator: Operator = Depends(require_location_reviewer),
+):
+    """驳回一条命名审核告警：不碰任何Location行，只把alert本身标记为
+    dismissed(表示人工已经看过，认为不需要处理)。"""
+    alert = await _get_pending_naming_alert(session, alert_id)
+    alert.status = "dismissed"
+    alert.resolved_by = operator.id
+    alert.resolved_at = datetime.now(timezone.utc)
+    await session.commit()
+    return await _serialize_naming_alert_with_locations(session, alert)
