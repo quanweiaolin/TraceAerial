@@ -99,6 +99,11 @@ class Video(Base):
     # 真实拍摄位置。没有SRT/解析不出轨迹时是NULL(未知，不是True也不是
     # False)，不是所有视频都能判定
     is_stable: Mapped[bool | None] = mapped_column(Boolean)
+    # 2026-11-27加：collect_lon仍为NULL时(SRT文件比视频晚落盘)，"已存在
+    # 视频"扫描分支重新尝试解析SRT失败的次数，达到10次不再重试——见
+    # scanner.py run_scan里existing视频分支那段。GPS解析成功后这个值
+    # 不再被读取，不需要清零。
+    srt_retry_count: Mapped[int] = mapped_column(Integer, default=0)
     # 同一个storage_path上的视频被重新编码(比如瘦身转码)会产生新sha256；
     # 这个自引用字段指回被替代的旧sha256，旧记录靠deleted_at软删除下线，
     # 保留血缘方便追溯"这个位置的视频历史上有过哪些版本"。见scanner.py处理逻辑。

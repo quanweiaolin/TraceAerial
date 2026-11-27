@@ -45,10 +45,15 @@ from app.services.hashing import compute_sha256_and_sha1
 from app.services.location_naming_audit import detect_naming_alerts
 from app.services.notifier import send_feishu_message
 from app.services.session_naming import find_session_match
-from app.services.video_metadata import extract_new_video_fields
+from app.services.video_metadata import extract_new_video_fields, extract_srt_fields
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
 COMMIT_BATCH_SIZE = 100  # 每处理这么多个文件落库一次，避免大目录跑到一半被杀/OOM全部白扫
+
+# collect_lon仍为NULL的已入库视频，每次扫描重试解析SRT的次数上限——超过
+# 这个数还是没有GPS，大概率是真的没有SRT伴随文件，不再每次扫描都重新
+# stat一次NAS上的文件(2026-11-27加，见run_scan里existing视频分支那段)
+SRT_RETRY_LIMIT = 10
 
 
 async def _get_or_create_device(session: AsyncSession, model: str) -> int:
@@ -410,6 +415,33 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
                     existing.storage_path = str(path)
                     if old_folder != new_folder:
                         relocations[(old_folder, new_folder)].append(old_path)
+
+            if existing.collect_lon is None and existing.srt_retry_count < SRT_RETRY_LIMIT:
+                # 视频文件和配套.srt轨迹文件不一定同时落盘完成——第一次入库
+                # 那一刻解析不出GPS的话，原来的逻辑永远不会再重试(新视频的
+                # SRT解析只在_apply_session_metadata里跑一次)，GPS/location_id
+                # 就永久卡在NULL(2026-11-27发现生产环境19条视频这样卡住，
+                # 靠scripts/backfill_missing_location_id.py手动补了一次)。
+                # 这里改成：每次扫描只要collect_lon还是空的就重新试一次，
+                # 读到了就顺带补跑地址聚类；重试达到上限就不再试，避免
+                # 真的没有SRT的视频每次扫描都白白stat一次NAS上的文件。
+                srt_fields = await asyncio.to_thread(
+                    extract_srt_fields, path, settings.flight_stability_max_drift_meters
+                )
+                if srt_fields["collect_lon"] is not None:
+                    existing.collect_lon = srt_fields["collect_lon"]
+                    existing.collect_lat = srt_fields["collect_lat"]
+                    existing.srt_height = srt_fields["srt_height"]
+                    existing.is_stable = srt_fields["is_stable"]
+                    if existing.location_id is None and not existing.location_confirmed:
+                        match = find_session_match(path)
+                        if match is not None:
+                            await _assign_city_site(
+                                session, existing, match.group("city"), match.group("site")
+                            )
+                            touched_cities.add(match.group("city"))
+                else:
+                    existing.srt_retry_count += 1
 
         discovery.resolved_video_sha256 = digest
 
