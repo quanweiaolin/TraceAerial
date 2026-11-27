@@ -108,6 +108,10 @@ export interface NamingAlert {
   alert_type: "name_drift" | "merge_candidate";
   city: string;
   location_ids: number[];
+  // 后端(location_review._serialize_naming_alert)按location_ids顺序批量
+  // 补上每个地点当前的city/site，前端直接展示，不用再逐个查。
+  // 注意可能比location_ids短：对应的Location行已经不存在时会被跳过
+  locations: { id: number; city: string; site: string }[];
   raw_site_votes: Record<string, unknown>;
   suggested_value: string | null;
   status: "pending" | "confirmed" | "dismissed";
