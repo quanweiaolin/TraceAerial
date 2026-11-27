@@ -42,6 +42,7 @@ from app.config import settings
 from app.models import Device, Location, Notification, Operator, ScanDiscovery, ScanJob, Video
 from app.services.geo import distance_3d_meters
 from app.services.hashing import compute_sha256_and_sha1
+from app.services.location_naming_audit import detect_naming_alerts
 from app.services.notifier import send_feishu_message
 from app.services.session_naming import find_session_match
 from app.services.video_metadata import extract_new_video_fields
@@ -158,6 +159,7 @@ async def _assign_city_site(
         )
         if fits:
             video.location_id = candidate_id
+            await detect_naming_alerts(session, city)
             return
 
     # 没有任何已有地址能装下这个新点，新建一个地址。命名"{raw_site}_{序号}"，
@@ -181,6 +183,7 @@ async def _assign_city_site(
     session.add(new_location)
     await session.flush()  # 拿到new_location.id
     video.location_id = new_location.id
+    await detect_naming_alerts(session, city)
 
 
 async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
