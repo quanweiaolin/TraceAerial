@@ -46,30 +46,55 @@ def test_merge_candidate_suppressed_when_already_grouped():
 
 
 def test_clean_cluster_no_alert():
-    candidates = build_alert_candidates({22: {"guanfogaosuchuzadao": 50}})
+    candidates = build_alert_candidates("dongguan", {22: {"guanfogaosuchuzadao": 50}})
     assert candidates == []
 
 
 def test_single_video_location_no_drift_alert():
-    candidates = build_alert_candidates({23: {"guanfogaosuchuzadao": 1}})
+    candidates = build_alert_candidates("dongguan", {23: {"guanfogaosuchuzadao": 1}})
     assert candidates == []
 
 
 def test_name_drift_suggests_majority():
-    candidates = build_alert_candidates({22: {"guanfogaosuchuzadao": 48, "guanfugaosuchuzadao": 2}})
+    candidates = build_alert_candidates("dongguan", {22: {"guanfogaosuchuzadao": 48, "guanfugaosuchuzadao": 2}})
     assert len(candidates) == 1
     assert candidates[0].alert_type == "name_drift"
     assert candidates[0].suggested_value == "guanfogaosuchuzadao"
+    assert candidates[0].city == "dongguan"  # 验证city字段被正确设置
 
 
 def test_merge_candidate_across_location_ids():
-    candidates = build_alert_candidates({
+    candidates = build_alert_candidates("dongguan", {
         22: {"guanfogaosuchuzadao": 50},
         23: {"guanfogaosuchuzadao": 1},
     })
     assert len(candidates) == 1
     assert candidates[0].alert_type == "merge_candidate"
     assert set(candidates[0].location_ids) == {22, 23}
+    assert candidates[0].city == "dongguan"  # 验证city字段被正确设置
+
+
+def test_merge_candidate_different_sites_same_locations():
+    # 测试Important #2：两个不同的site文本都映射到相同的location_ids，
+    # 应该生成2个独立的merge_candidate，而不是被去重时丢弃
+    candidates = build_alert_candidates("dongguan", {
+        22: {"a": 1, "b": 1},
+        23: {"a": 1, "b": 1},
+    })
+
+    # 筛选出只是merge_candidate类型的候选（排除name_drift）
+    merge_candidates = [c for c in candidates if c.alert_type == "merge_candidate"]
+    assert len(merge_candidates) == 2, f"Expected 2 merge_candidates, got {len(merge_candidates)}"
+
+    # 两个merge_candidate应该对应两个不同的site
+    suggested_values = {c.suggested_value for c in merge_candidates}
+    assert suggested_values == {"a", "b"}, f"Expected {{'a', 'b'}}, got {suggested_values}"
+
+    # 两个merge_candidate都应该涉及相同的location_ids
+    for c in merge_candidates:
+        assert c.alert_type == "merge_candidate"
+        assert set(c.location_ids) == {22, 23}
+        assert c.city == "dongguan"
 
 
 def test_fingerprint_stable_regardless_of_key_order():

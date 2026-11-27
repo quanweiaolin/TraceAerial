@@ -69,9 +69,13 @@ def compute_votes_fingerprint(raw_site_votes: dict[str, int]) -> str:
     return hashlib.md5(serialized.encode()).hexdigest()
 
 
-def build_alert_candidates(city_votes: dict[int, dict[str, int]]) -> list[AlertCandidate]:
+def build_alert_candidates(city: str, city_votes: dict[int, dict[str, int]]) -> list[AlertCandidate]:
     """
     从单个城市的投票数据({location_id: {raw_site: 次数}})生成告警候选。
+
+    参数：
+    - city: 城市名称（会被记录到每个AlertCandidate）
+    - city_votes: 该城市的投票数据
 
     检测两类问题：
     1. name_drift: 某location_id下的site文本不一致(超过1个不同的key)
@@ -86,7 +90,7 @@ def build_alert_candidates(city_votes: dict[int, dict[str, int]]) -> list[AlertC
             suggested_value = max(site_votes.items(), key=lambda x: x[1])[0]
             candidates.append(AlertCandidate(
                 alert_type="name_drift",
-                city="",  # name_drift不需要city字段，但必须填
+                city=city,
                 location_ids=[location_id],
                 raw_site_votes=site_votes,
                 suggested_value=suggested_value,
@@ -102,13 +106,14 @@ def build_alert_candidates(city_votes: dict[int, dict[str, int]]) -> list[AlertC
             site_to_locations[site].append(location_id)
 
     # 对于出现在多个location_id的site，生成merge_candidate
-    seen_merge_candidates = set()  # 用于去重
+    # 用(raw_site_text, frozenset(location_ids))作为key，避免同location_ids下不同site文本的merge_candidate被重复丢弃
+    seen_merge_candidates: set[tuple[str, frozenset[int]]] = set()
     for site, location_ids in site_to_locations.items():
         if len(location_ids) > 1:
-            # 避免重复（如果多个site都出现在相同的location_ids）
-            location_ids_set = frozenset(location_ids)
-            if location_ids_set not in seen_merge_candidates:
-                seen_merge_candidates.add(location_ids_set)
+            # 避免重复（但要允许不同site文本出现在相同location_ids的情况）
+            merge_key = (site, frozenset(location_ids))
+            if merge_key not in seen_merge_candidates:
+                seen_merge_candidates.add(merge_key)
 
                 # raw_site_votes格式：{raw_site: {location_id: count}}
                 raw_site_votes_nested: dict[str, dict[int, int]] = {}
@@ -119,7 +124,7 @@ def build_alert_candidates(city_votes: dict[int, dict[str, int]]) -> list[AlertC
 
                 candidates.append(AlertCandidate(
                     alert_type="merge_candidate",
-                    city="",  # merge_candidate也不需要city字段
+                    city=city,
                     location_ids=sorted(location_ids),
                     raw_site_votes=raw_site_votes_nested,
                     suggested_value=site,
