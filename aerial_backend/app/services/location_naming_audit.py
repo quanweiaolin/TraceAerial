@@ -26,12 +26,29 @@ from .session_naming import find_session_match
 
 @dataclass
 class AlertCandidate:
-    """命名审核告警候选。"""
+    """命名审核告警候选。
+
+    `raw_site_votes`存完整票数(前端要展示"某个拼写被投了多少票")，但
+    **票数不参与去重fingerprint**——fingerprint只看`fingerprint_input`，
+    也就是"这个问题的身份"：
+    - name_drift: 这个location下出现过的不同拼写的集合(sorted keys)
+    - merge_candidate: (撞名的site文本, 涉及的location_id集合)
+
+    为什么必须分开(终审Critical#1)：原来fingerprint直接哈希整个
+    {raw_site: 次数}字典，结果这个city每进一个新视频票数就变一次，
+    fingerprint跟着变，去重失效，同一个命名问题被反复插成新的pending
+    告警；而raw site文本存在storage_path里(按本方案约束永不改写)，
+    所以拼写漂移这种条件是**永久性**的，一旦存在就会每来一个视频复活
+    一条新告警，哪怕人工早就confirm/dismiss过了。改成只哈希身份后：
+    票数变化不再重复告警，真正出现第三种拼写/有新location加入同名
+    家族时才会重新告警。
+    """
     alert_type: Literal["name_drift", "merge_candidate"]
     city: str
     location_ids: list[int]
     raw_site_votes: dict
     suggested_value: str
+    fingerprint_input: list
 
 
 def tally_raw_site_votes(video_rows: list[tuple[int, str]]) -> dict[str, dict[int, dict[str, int]]]:
@@ -67,14 +84,17 @@ def tally_raw_site_votes(video_rows: list[tuple[int, str]]) -> dict[str, dict[in
     return result
 
 
-def compute_votes_fingerprint(raw_site_votes: dict[str, int]) -> str:
+def compute_votes_fingerprint(fingerprint_input) -> str:
     """
-    对单个location_id的{raw_site: 次数}字典计算fingerprint。
+    对"问题身份"(AlertCandidate.fingerprint_input)计算fingerprint。
 
-    按key排序后json序列化，再取md5，保证同样内容无论插入顺序如何都产生
-    同一个fingerprint。
+    按key排序后json序列化，再取md5，保证同样内容无论dict插入顺序如何都
+    产生同一个fingerprint。
+
+    注意输入**不是**{raw_site: 次数}票数字典(见AlertCandidate的docstring)：
+    票数只用于展示，让它流进哈希会导致每进一个新视频就重复告警一次。
     """
-    serialized = json.dumps(raw_site_votes, sort_keys=True)
+    serialized = json.dumps(fingerprint_input, sort_keys=True)
     return hashlib.md5(serialized.encode()).hexdigest()
 
 
@@ -103,6 +123,8 @@ def build_alert_candidates(city: str, city_votes: dict[int, dict[str, int]]) -> 
                 location_ids=[location_id],
                 raw_site_votes=site_votes,
                 suggested_value=suggested_value,
+                # 身份 = 这个location下出现过的不同拼写的集合，不含票数
+                fingerprint_input=sorted(site_votes.keys()),
             ))
 
     # 检测 merge_candidate：某个site文本出现在多个location_id
@@ -137,6 +159,8 @@ def build_alert_candidates(city: str, city_votes: dict[int, dict[str, int]]) -> 
                     location_ids=sorted(location_ids),
                     raw_site_votes=raw_site_votes_nested,
                     suggested_value=site,
+                    # 身份 = (撞名的site文本, 涉及的location_id集合)，不含票数
+                    fingerprint_input=[site, sorted(location_ids)],
                 ))
 
     return candidates
@@ -178,24 +202,40 @@ def is_already_grouped(location_ids: list[int], group_id_by_location: dict[int, 
     return True
 
 
-async def compute_city_votes(session: AsyncSession, city: str) -> dict[int, dict[str, int]]:
+async def tally_all_votes(session: AsyncSession) -> dict[str, dict[int, dict[str, int]]]:
     """
-    查这个city下location_id不为空的全部(活着的)视频的(location_id, storage_path)，
-    喂给tally_raw_site_votes统计投票，只取该city那一层返回。
+    查location_id不为空的全部(活着的)视频的(location_id, storage_path)，
+    喂给tally_raw_site_votes统计投票，返回{city: {location_id: {site: 次数}}}。
+
+    **不按Video.city列过滤**(终审Important#3)：本方案的硬约束是city/site
+    一律用find_session_match从storage_path重新解析，不读存着的名字列当
+    事实来源——Video.city是扫描时写进去的快照，会过期(见
+    services/session_naming.py的docstring里2026-11-03设备白名单变更
+    那个真实案例)。这里的city分组完全来自重新解析的结果。
 
     deleted_at不为空的视频(被瘦身下线的旧记录)不参与统计——它们的storage_path
     已经不代表"这次扫描时文件实际在哪"，混进来会污染投票。
     """
     rows_result = await session.execute(
         select(Video.location_id, Video.storage_path)
-        .where(Video.city == city)
         .where(Video.location_id.isnot(None))
         .where(Video.deleted_at.is_(None))
     )
     video_rows = [(location_id, storage_path) for location_id, storage_path in rows_result]
+    return tally_raw_site_votes(video_rows)
 
-    all_city_votes = tally_raw_site_votes(video_rows)
-    return all_city_votes.get(city, {})
+
+async def list_cities_from_videos(session: AsyncSession) -> set[str]:
+    """从重新解析storage_path得到的投票数据里取city列表(不是
+    `select distinct Location.city`——同上，存着的名字列不是事实来源)。
+    供backfill脚本决定"要扫哪些city"。"""
+    return set(await tally_all_votes(session))
+
+
+async def compute_city_votes(session: AsyncSession, city: str) -> dict[int, dict[str, int]]:
+    """取单个city那一层的投票数据。city参数只用来从"全量重新解析"的结果里
+    挑一个key出来，不参与SQL过滤(见tally_all_votes)。"""
+    return (await tally_all_votes(session)).get(city, {})
 
 
 async def detect_naming_alerts(session: AsyncSession, city: str) -> int:
@@ -221,7 +261,8 @@ async def detect_naming_alerts(session: AsyncSession, city: str) -> int:
         # location_ids按升序排好再存/比较，保证同一组合不会因为顺序不同绕过
         # 下面的唯一索引去重，也不会因为顺序不同查不到已有的fingerprint
         sorted_location_ids = sorted(candidate.location_ids)
-        fingerprint = compute_votes_fingerprint(candidate.raw_site_votes)
+        # 只哈希"问题身份"，不哈希票数(见AlertCandidate的docstring)
+        fingerprint = compute_votes_fingerprint(candidate.fingerprint_input)
 
         if candidate.alert_type == "merge_candidate":
             group_rows_result = await session.execute(
@@ -243,7 +284,8 @@ async def detect_naming_alerts(session: AsyncSession, city: str) -> int:
         existing_fingerprints = {fp for (fp,) in existing_fingerprints_result}
         if is_duplicate_fingerprint(fingerprint, existing_fingerprints):
             # 去重不看status(见is_duplicate_fingerprint的docstring)：这个组合的
-            # 投票分布之前已经提示过(不管后来是confirm还是dismiss)，不重复插入
+            # 问题身份(拼写集合/撞名site+location集合，不含票数)之前已经提示过
+            # (不管后来是confirm还是dismiss)，不重复插入
             continue
 
         alert = LocationNamingAlert(

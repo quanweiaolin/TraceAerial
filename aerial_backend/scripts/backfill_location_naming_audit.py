@@ -13,18 +13,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from sqlalchemy import func, select  # noqa: E402
-
 from app.db import SessionContext  # noqa: E402
-from app.models import Location  # noqa: E402
-from app.services.location_naming_audit import detect_naming_alerts  # noqa: E402
+from app.services.location_naming_audit import (  # noqa: E402
+    detect_naming_alerts,
+    list_cities_from_videos,
+)
 
 
 async def main() -> None:
     async with SessionContext() as session:
-        # 查所有不同的city
-        result = await session.execute(select(func.distinct(Location.city)))
-        cities = [row[0] for row in result]
+        # city列表来自"重新解析storage_path"的结果，不是select distinct
+        # Location.city——本方案的硬约束是city/site一律重新解析，不读存着的
+        # 名字列当事实来源(终审Important#3)
+        cities = sorted(await list_cities_from_videos(session))
 
         total_inserted = 0
         for city in cities:

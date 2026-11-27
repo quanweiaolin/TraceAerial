@@ -103,6 +103,96 @@ def test_fingerprint_stable_regardless_of_key_order():
     assert a == b
 
 
+def _fingerprint_of_only(candidates, alert_type):
+    picked = [c for c in candidates if c.alert_type == alert_type]
+    assert len(picked) == 1, f"Expected exactly 1 {alert_type}, got {len(picked)}"
+    return compute_votes_fingerprint(picked[0].fingerprint_input)
+
+
+def test_name_drift_fingerprint_ignores_vote_counts():
+    # 终审Critical#1：票数变了(这个city又进了几个新视频)不算新问题，
+    # fingerprint必须不变，否则同一个拼写漂移会被反复提示、
+    # confirm/dismiss过的也会永远复活
+    a = _fingerprint_of_only(
+        build_alert_candidates("dongguan", {22: {"guanfogaosuchuzadao": 48, "guanfugaosuchuzadao": 2}}),
+        "name_drift",
+    )
+    b = _fingerprint_of_only(
+        build_alert_candidates("dongguan", {22: {"guanfogaosuchuzadao": 300, "guanfugaosuchuzadao": 7}}),
+        "name_drift",
+    )
+    assert a == b
+
+
+def test_name_drift_fingerprint_changes_when_new_spelling_appears():
+    # 真的多出第三种拼写 = 新问题，应该重新提示
+    a = _fingerprint_of_only(
+        build_alert_candidates("dongguan", {22: {"guanfogaosuchuzadao": 48, "guanfugaosuchuzadao": 2}}),
+        "name_drift",
+    )
+    c = _fingerprint_of_only(
+        build_alert_candidates(
+            "dongguan",
+            {22: {"guanfogaosuchuzadao": 48, "guanfugaosuchuzadao": 2, "guanfogaosuchuzhadao": 1}},
+        ),
+        "name_drift",
+    )
+    assert a != c
+
+
+def test_merge_candidate_fingerprint_ignores_vote_counts():
+    a = _fingerprint_of_only(
+        build_alert_candidates("dongguan", {22: {"guanfogaosuchuzadao": 50}, 23: {"guanfogaosuchuzadao": 1}}),
+        "merge_candidate",
+    )
+    b = _fingerprint_of_only(
+        build_alert_candidates("dongguan", {22: {"guanfogaosuchuzadao": 51}, 23: {"guanfogaosuchuzadao": 9}}),
+        "merge_candidate",
+    )
+    assert a == b
+
+
+def test_merge_candidate_fingerprint_changes_when_location_set_changes():
+    # 有新location加入同名家族 = 新问题，应该重新提示
+    a = _fingerprint_of_only(
+        build_alert_candidates("dongguan", {22: {"guanfogaosuchuzadao": 50}, 23: {"guanfogaosuchuzadao": 1}}),
+        "merge_candidate",
+    )
+    b = _fingerprint_of_only(
+        build_alert_candidates(
+            "dongguan",
+            {22: {"guanfogaosuchuzadao": 50}, 23: {"guanfogaosuchuzadao": 1}, 24: {"guanfogaosuchuzadao": 1}},
+        ),
+        "merge_candidate",
+    )
+    assert a != b
+
+
+def test_merge_candidate_fingerprints_differ_per_site_text():
+    # 同一组location_ids下两个不同的撞名site文本必须是两条不同的提示，
+    # fingerprint不能撞(配合build_alert_candidates的seen_merge_candidates)
+    candidates = build_alert_candidates("dongguan", {22: {"a": 1, "b": 1}, 23: {"a": 1, "b": 1}})
+    merge_fps = {
+        compute_votes_fingerprint(c.fingerprint_input)
+        for c in candidates
+        if c.alert_type == "merge_candidate"
+    }
+    assert len(merge_fps) == 2
+
+
+def test_name_drift_and_merge_candidate_fingerprints_do_not_collide():
+    # 同一批数据同时产生两类告警时，两者的fingerprint不能相同
+    candidates = build_alert_candidates(
+        "dongguan", {22: {"a": 5, "b": 1}, 23: {"a": 1, "b": 3}}
+    )
+    drift = [c for c in candidates if c.alert_type == "name_drift"]
+    merge = [c for c in candidates if c.alert_type == "merge_candidate"]
+    assert drift and merge
+    drift_fps = {compute_votes_fingerprint(c.fingerprint_input) for c in drift}
+    merge_fps = {compute_votes_fingerprint(c.fingerprint_input) for c in merge}
+    assert not (drift_fps & merge_fps)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

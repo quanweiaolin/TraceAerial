@@ -129,7 +129,13 @@ async def _assign_city_site(
     False，SRT轨迹本身跨度太大、单点GPS不代表真实拍摄位置)的视频不参与
     聚类，video.location_id保持NULL；地址一旦分配不会再改(调用方保证
     video是刚入库、location_id还是空的新记录，不会对已有地址的视频重新
-    判定)。"""
+    判定)。
+
+    命名审核(detect_naming_alerts)**不在这里调**：它一次要重新解析全部
+    视频的storage_path，放在这里就是每个视频跑一遍、同一次扫描O(N²)，
+    而且同一个命名问题会被反复提示N次。改成run_scan扫完整个root之后，
+    对这次真正碰到的每个city各跑一次(见run_scan里的touched_cities，
+    终审Important#2)。"""
     if video.location_confirmed:
         return
     if video.collect_lon is None or video.collect_lat is None:
@@ -159,7 +165,6 @@ async def _assign_city_site(
         )
         if fits:
             video.location_id = candidate_id
-            await detect_naming_alerts(session, city)
             return
 
     # 没有任何已有地址能装下这个新点，新建一个地址。命名"{raw_site}_{序号}"，
@@ -183,7 +188,6 @@ async def _assign_city_site(
     session.add(new_location)
     await session.flush()  # 拿到new_location.id
     video.location_id = new_location.id
-    await detect_naming_alerts(session, city)
 
 
 async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
@@ -213,6 +217,9 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
     # (old_folder, new_folder) -> 两边都真实存在、内容重复的新路径列表，
     # 扫完整个root后统一报一次(且只报一次，见循环结束后那段)
     duplicates: dict[tuple[str, str], list[str]] = defaultdict(list)
+    # 这次扫描真正碰到(_apply_session_metadata给video.city赋过值)的city集合，
+    # 扫完整个root后对每个city各跑一次命名审核(见循环结束后那段)
+    touched_cities: set[str] = set()
 
     for path in Path(root_path).rglob("*"):
         if not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS:
@@ -327,6 +334,8 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
                     # services/session_naming.py)，顺带补上device_id/collected_by；
                     # 解析不出来就保持原样(不是所有视频都来自这套命名规范)
                     await _apply_session_metadata(session, video, path)
+                    if video.city is not None:
+                        touched_cities.add(video.city)
                     await session.flush()  # 必须在这里flush，确保video先落库，
                     # 不然下面Notification.video_sha256(外键指向videos.sha256)可能
                     # 在同一次自动flush里insert顺序不对，报FK违反(见2026-09-07的事故)
@@ -413,6 +422,17 @@ async def run_scan(session: AsyncSession, root_path: str) -> ScanJob:
         if files_found % COMMIT_BATCH_SIZE == 0:
             await session.commit()
             print(f"[scan] committed at files_found={files_found}", flush=True)
+
+    if touched_cities:
+        # 命名审核：每次扫描、每个这次碰到的city各跑一次，不是每个视频跑一次
+        # (终审Important#2)。放在主循环之后、最后那次commit之前：
+        # detect_naming_alerts自己不commit，插进来的alert行跟这次扫描的其他
+        # 改动一起在函数末尾那次session.commit()里落库，一起成功或一起回滚。
+        # 先flush，保证这次扫描新建的location/新写的video.location_id对
+        # detect_naming_alerts里的查询可见
+        await session.flush()
+        for city in sorted(touched_cities):
+            await detect_naming_alerts(session, city)
 
     if relocations:
         # 只有old_folder下已经一个活着的视频都不剩(这次扫描把它见到的全部
