@@ -3,7 +3,11 @@
 检测名称漂移(某location下的site文本不一致)和可能需合并的集群
 (同一个site文本出现在多个location_id下)。
 
-纯函数模块，不涉及DB访问，便于单独测试。
+核心判断逻辑(tally_raw_site_votes/compute_votes_fingerprint/build_alert_candidates/
+is_duplicate_fingerprint/is_already_grouped)是纯函数，不涉及DB访问，便于单独测试；
+本文件末尾的compute_city_votes/detect_naming_alerts是薄的DB聚合与写入层，只负责
+查数据、把结果接到上面这些纯函数上做判断、按判断结果插入alert行，不重新实现判断
+逻辑本身。
 """
 from __future__ import annotations
 
@@ -12,6 +16,11 @@ import json
 from dataclasses import dataclass
 from typing import Literal
 
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..models import Location, LocationNamingAlert, Video
 from .session_naming import find_session_match
 
 
@@ -167,3 +176,97 @@ def is_already_grouped(location_ids: list[int], group_id_by_location: dict[int, 
             return False
 
     return True
+
+
+async def compute_city_votes(session: AsyncSession, city: str) -> dict[int, dict[str, int]]:
+    """
+    查这个city下location_id不为空的全部(活着的)视频的(location_id, storage_path)，
+    喂给tally_raw_site_votes统计投票，只取该city那一层返回。
+
+    deleted_at不为空的视频(被瘦身下线的旧记录)不参与统计——它们的storage_path
+    已经不代表"这次扫描时文件实际在哪"，混进来会污染投票。
+    """
+    rows_result = await session.execute(
+        select(Video.location_id, Video.storage_path)
+        .where(Video.city == city)
+        .where(Video.location_id.isnot(None))
+        .where(Video.deleted_at.is_(None))
+    )
+    video_rows = [(location_id, storage_path) for location_id, storage_path in rows_result]
+
+    all_city_votes = tally_raw_site_votes(video_rows)
+    return all_city_votes.get(city, {})
+
+
+async def detect_naming_alerts(session: AsyncSession, city: str) -> int:
+    """
+    扫描单个city，把build_alert_candidates算出来的候选落成location_naming_alerts
+    表里的pending记录。只是薄的DB聚合+写入层：真正"算出候选""要不要跳过"的判断
+    全部交给Task1的纯函数(build_alert_candidates/is_already_grouped/
+    is_duplicate_fingerprint)，这里不重新实现判断逻辑。
+
+    返回这次调用里真正新插入的条数(供backfill脚本打印统计用)——不是候选总数：
+    候选里被"已经分组"或"fingerprint已存在"挡掉的不算，被并发扫描抢先插入
+    (IntegrityError)的也不算。
+
+    不在这里commit——调用方(scanner.py钩子/backfill脚本)决定何时commit，这样
+    这次扫描新插入的alert行能跟同一次扫描的其他改动(比如新video/新location)
+    一起成功或一起回滚。
+    """
+    city_votes = await compute_city_votes(session, city)
+    candidates = build_alert_candidates(city, city_votes)
+
+    inserted_count = 0
+    for candidate in candidates:
+        # location_ids按升序排好再存/比较，保证同一组合不会因为顺序不同绕过
+        # 下面的唯一索引去重，也不会因为顺序不同查不到已有的fingerprint
+        sorted_location_ids = sorted(candidate.location_ids)
+        fingerprint = compute_votes_fingerprint(candidate.raw_site_votes)
+
+        if candidate.alert_type == "merge_candidate":
+            group_rows_result = await session.execute(
+                select(Location.id, Location.location_group_id)
+                .where(Location.id.in_(sorted_location_ids))
+            )
+            group_id_by_location = {
+                location_id: group_id for location_id, group_id in group_rows_result
+            }
+            if is_already_grouped(sorted_location_ids, group_id_by_location):
+                # 这些location已经被人工确认是同一个地址了，不用再提示合并
+                continue
+
+        existing_fingerprints_result = await session.execute(
+            select(LocationNamingAlert.votes_fingerprint)
+            .where(LocationNamingAlert.alert_type == candidate.alert_type)
+            .where(LocationNamingAlert.location_ids == sorted_location_ids)
+        )
+        existing_fingerprints = {fp for (fp,) in existing_fingerprints_result}
+        if is_duplicate_fingerprint(fingerprint, existing_fingerprints):
+            # 去重不看status(见is_duplicate_fingerprint的docstring)：这个组合的
+            # 投票分布之前已经提示过(不管后来是confirm还是dismiss)，不重复插入
+            continue
+
+        alert = LocationNamingAlert(
+            alert_type=candidate.alert_type,
+            city=candidate.city,
+            location_ids=sorted_location_ids,
+            raw_site_votes=candidate.raw_site_votes,
+            votes_fingerprint=fingerprint,
+            suggested_value=candidate.suggested_value,
+        )
+        try:
+            # 跟scanner.py:_apply_session_metadata里同样的SAVEPOINT套路：
+            # 定时扫描和backfill脚本可能并发对同一个city跑这个函数，两边都在
+            # 上面的fingerprint查询里没查到之后抢着插入同一个组合，后提交的
+            # 那边会撞idx_location_naming_alerts_dedupe唯一索引冲突。只回滚到
+            # SAVEPOINT，把这次冲突当成"已经有人插过了"处理，不让整个调用方的
+            # 事务(可能还夹着这次扫描的其他改动)被拖垮
+            async with session.begin_nested():
+                session.add(alert)
+                await session.flush()
+        except IntegrityError:
+            continue
+        else:
+            inserted_count += 1
+
+    return inserted_count

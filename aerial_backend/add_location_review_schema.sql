@@ -74,3 +74,22 @@ ALTER TABLE locations
 
 ALTER TABLE location_groups
     ADD COLUMN IF NOT EXISTS aliases jsonb NOT NULL DEFAULT '{}';
+
+-- 2026-11-27加：命名审核告警表，见app/services/location_naming_audit.py。
+CREATE TABLE IF NOT EXISTS location_naming_alerts (
+    id                 bigserial PRIMARY KEY,
+    alert_type         text NOT NULL CHECK (alert_type IN ('name_drift', 'merge_candidate')),
+    city               text NOT NULL,
+    location_ids       bigint[] NOT NULL,
+    raw_site_votes     jsonb NOT NULL,
+    votes_fingerprint  text NOT NULL,
+    suggested_value    text,
+    status             text NOT NULL DEFAULT 'pending'
+                       CHECK (status IN ('pending', 'confirmed', 'dismissed')),
+    resolved_by        integer REFERENCES operators(id),
+    resolved_at        timestamptz,
+    created_at         timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_location_naming_alerts_dedupe
+    ON location_naming_alerts (alert_type, location_ids, votes_fingerprint);

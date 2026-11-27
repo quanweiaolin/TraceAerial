@@ -364,3 +364,24 @@ class LocationChangeHistory(Base):
     changed_by: Mapped[int | None] = mapped_column(ForeignKey("operators.id"))
     changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     reason: Mapped[str | None] = mapped_column(Text)
+
+
+class LocationNamingAlert(Base):
+    """命名审核告警：某location下上传者填的原始site文本不一致(name_drift)，
+    或同一个site文本出现在多个location_id下疑似本该是同一个地址
+    (merge_candidate)。alert_type/status的取值在SQL层有CHECK约束，ORM层
+    不重复声明。去重靠(alert_type, location_ids, votes_fingerprint)唯一索引，
+    见app/services/location_naming_audit.py和add_location_review_schema.sql。"""
+
+    __tablename__ = "location_naming_alerts"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    alert_type: Mapped[str] = mapped_column(Text)
+    city: Mapped[str] = mapped_column(Text)
+    location_ids: Mapped[list[int]] = mapped_column(ARRAY(BigInteger))
+    raw_site_votes: Mapped[dict] = mapped_column(JSONB)
+    votes_fingerprint: Mapped[str] = mapped_column(Text)
+    suggested_value: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text, default="pending")
+    resolved_by: Mapped[int | None] = mapped_column(ForeignKey("operators.id"))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
