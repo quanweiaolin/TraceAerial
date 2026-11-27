@@ -97,3 +97,19 @@ export interface AgreementRate {
   disagreed: number;
   ready_for_automation: boolean;
 }
+
+// 后端 GET /location-review/naming-alerts 的返回形状——命名审核提示。
+// alert_type为"name_drift"时raw_site_votes是扁平的{候选名字: 票数}，
+// 为"merge_candidate"时是嵌套的{候选名字: {location_id: 票数}}(两种类型
+// 形状不同，这里用Record<string, unknown>兜底，具体渲染时各自按需要的
+// 形状去读)。suggested_value为null代表后端还没能算出一个推荐值。
+export interface NamingAlert {
+  id: number;
+  alert_type: "name_drift" | "merge_candidate";
+  city: string;
+  location_ids: number[];
+  raw_site_votes: Record<string, unknown>;
+  suggested_value: string | null;
+  status: "pending" | "confirmed" | "dismissed";
+  created_at: string;
+}

@@ -6,6 +6,7 @@ const NAV_ITEMS = [
   { to: "/folder-audit", label: "文件夹审查" },
   { to: "/locations", label: "地点" },
   { to: "/groups", label: "分组" },
+  { to: "/naming-audit", label: "命名审核" },
   { to: "/agreement-rate", label: "一致率看板" },
 ];
 
